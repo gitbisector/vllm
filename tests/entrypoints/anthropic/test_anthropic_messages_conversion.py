@@ -12,7 +12,14 @@ blocks echoed back by Anthropic clients.
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
-from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+from vllm.entrypoints.anthropic.serving import (
+    AnthropicServingMessages,
+    _build_anthropic_usage,
+)
+from vllm.entrypoints.openai.engine.protocol import (
+    PromptTokenUsageInfo,
+    UsageInfo,
+)
 
 _convert = AnthropicServingMessages._convert_anthropic_to_openai_request
 _img_url = AnthropicServingMessages._convert_image_source_to_url
@@ -635,3 +642,69 @@ class TestThinkingBlockConversion:
         # Redacted thinking is ignored, normal thinking still becomes reasoning.
         assert asst.get("reasoning") == "Thinking..."
         assert asst.get("content") == "Hi!"
+
+
+# ======================================================================
+# _build_anthropic_usage — mapping OpenAI UsageInfo to Anthropic Usage,
+# including cache_read_input_tokens pulled from prompt_tokens_details
+# ======================================================================
+
+
+class TestBuildAnthropicUsage:
+    def test_no_usage_returns_zeros(self):
+        """Defensive: vLLM can omit usage on early stream chunks."""
+        usage = _build_anthropic_usage(None)
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+        assert usage.cache_read_input_tokens is None
+        assert usage.cache_creation_input_tokens is None
+
+    def test_usage_without_prompt_token_details(self):
+        """Engine not started with --enable-prompt-tokens-details."""
+        src = UsageInfo(prompt_tokens=120, completion_tokens=30, total_tokens=150)
+        usage = _build_anthropic_usage(src)
+        assert usage.input_tokens == 120
+        assert usage.output_tokens == 30
+        assert usage.cache_read_input_tokens is None
+
+    def test_cache_read_populated_from_prompt_tokens_details(self):
+        """Prefix-cache hits surface as cache_read_input_tokens."""
+        src = UsageInfo(
+            prompt_tokens=120,
+            completion_tokens=30,
+            total_tokens=150,
+            prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=80),
+        )
+        usage = _build_anthropic_usage(src)
+        assert usage.input_tokens == 120
+        assert usage.output_tokens == 30
+        assert usage.cache_read_input_tokens == 80
+        # vLLM doesn't distinguish read-vs-create so this stays unset.
+        assert usage.cache_creation_input_tokens is None
+
+    def test_prompt_tokens_details_empty_cached_field(self):
+        """prompt_tokens_details present but cached_tokens is None."""
+        src = UsageInfo(
+            prompt_tokens=120,
+            completion_tokens=30,
+            total_tokens=150,
+            prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=None),
+        )
+        usage = _build_anthropic_usage(src)
+        assert usage.input_tokens == 120
+        assert usage.cache_read_input_tokens is None
+
+    def test_force_output_zero_on_stream_start(self):
+        """message_start event must report output_tokens=0 even if the
+        source happens to carry a non-zero completion count."""
+        src = UsageInfo(prompt_tokens=50, completion_tokens=7, total_tokens=57)
+        usage = _build_anthropic_usage(src, force_output_zero=True)
+        assert usage.input_tokens == 50
+        assert usage.output_tokens == 0
+
+    def test_none_completion_tokens_coerced_to_zero(self):
+        """UsageInfo.completion_tokens is Optional; don't pass None through."""
+        src = UsageInfo(prompt_tokens=10, completion_tokens=None, total_tokens=10)
+        usage = _build_anthropic_usage(src)
+        assert usage.input_tokens == 10
+        assert usage.output_tokens == 0

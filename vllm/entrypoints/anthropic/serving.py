@@ -49,6 +49,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _build_anthropic_usage(
+    source_usage: Any,
+    *,
+    force_output_zero: bool = False,
+) -> AnthropicUsage:
+    """Translate vLLM's OpenAI-format ``UsageInfo`` into Anthropic's usage shape.
+
+    Pulls ``prompt_tokens_details.cached_tokens`` (populated by the OpenAI
+    chat serving when the engine runs with ``--enable-prompt-tokens-details``
+    and the request hits the prefix cache) into Anthropic's standard
+    ``cache_read_input_tokens`` field so that callers using the anthropic
+    SDK see prefix-cache hits without having to poke at
+    ``prompt_tokens_details`` directly.
+
+    ``force_output_zero`` is used by the streaming ``message_start`` event,
+    where Anthropic's protocol requires ``output_tokens=0`` on the first
+    chunk even if the source happens to have a non-zero count.
+
+    ``cache_creation_input_tokens`` is intentionally left unset: vLLM's
+    prefix cache auto-populates on every forward pass, so there is no
+    observable distinction between "read from existing cache entry" and
+    "created a new cache entry on this request" at the request level.
+    Leaving the field ``None`` (unset) is honest.
+    """
+    if source_usage is None:
+        return AnthropicUsage(
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    cached = None
+    details = getattr(source_usage, "prompt_tokens_details", None)
+    if details is not None:
+        cached = getattr(details, "cached_tokens", None)
+
+    return AnthropicUsage(
+        input_tokens=source_usage.prompt_tokens,
+        output_tokens=(
+            0
+            if force_output_zero
+            else (source_usage.completion_tokens or 0)
+        ),
+        cache_read_input_tokens=cached,
+    )
+
+
+
 def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
 
@@ -441,10 +488,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             id=generator.id,
             content=[],
             model=generator.model,
-            usage=AnthropicUsage(
-                input_tokens=generator.usage.prompt_tokens,
-                output_tokens=generator.usage.completion_tokens,
-            ),
+            usage=_build_anthropic_usage(generator.usage),
             kv_transfer_params=generator.kv_transfer_params,
         )
         choice = generator.choices[0]
@@ -595,11 +639,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     model=origin_chunk.model,
                                     stop_reason=None,
                                     stop_sequence=None,
-                                    usage=AnthropicUsage(
-                                        input_tokens=origin_chunk.usage.prompt_tokens
-                                        if origin_chunk.usage
-                                        else 0,
-                                        output_tokens=0,
+                                    usage=_build_anthropic_usage(
+                                        origin_chunk.usage,
+                                        force_output_zero=True,
                                     ),
                                 ),
                             )
@@ -618,14 +660,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                             chunk = AnthropicStreamEvent(
                                 type="message_delta",
                                 delta=AnthropicDelta(stop_reason=stop_reason),
-                                usage=AnthropicUsage(
-                                    input_tokens=origin_chunk.usage.prompt_tokens
-                                    if origin_chunk.usage
-                                    else 0,
-                                    output_tokens=origin_chunk.usage.completion_tokens
-                                    if origin_chunk.usage
-                                    else 0,
-                                ),
+                                usage=_build_anthropic_usage(origin_chunk.usage),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)
                             yield wrap_data_with_event(data, "message_delta")
