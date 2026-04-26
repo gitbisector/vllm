@@ -651,24 +651,47 @@ class TestThinkingBlockConversion:
 
 
 class TestBuildAnthropicUsage:
+    """Anthropic semantics (and what every cache-aware billing client
+    expects):
+
+        prompt_tokens == input_tokens
+                       + cache_creation_input_tokens
+                       + cache_read_input_tokens
+
+    `input_tokens` is the NEW (uncached) portion only.  Without this
+    invariant, downstream consumers that compute
+    `cache_read / (input + cache_read)` see hit-rates roughly halved
+    once caching kicks in.
+    """
+
     def test_no_usage_returns_zeros(self):
         """Defensive: vLLM can omit usage on early stream chunks."""
         usage = _build_anthropic_usage(None)
         assert usage.input_tokens == 0
         assert usage.output_tokens == 0
-        assert usage.cache_read_input_tokens is None
-        assert usage.cache_creation_input_tokens is None
+        assert usage.cache_creation_input_tokens == 0
+        assert usage.cache_read_input_tokens == 0
 
     def test_usage_without_prompt_token_details(self):
-        """Engine not started with --enable-prompt-tokens-details."""
+        """Engine not started with --enable-prompt-tokens-details: cached=0,
+        whole prompt counts as new input."""
         src = UsageInfo(prompt_tokens=120, completion_tokens=30, total_tokens=150)
         usage = _build_anthropic_usage(src)
         assert usage.input_tokens == 120
         assert usage.output_tokens == 30
-        assert usage.cache_read_input_tokens is None
+        assert usage.cache_read_input_tokens == 0
+        assert usage.cache_creation_input_tokens == 0
+        # Partition invariant
+        assert (
+            usage.input_tokens
+            + usage.cache_creation_input_tokens
+            + usage.cache_read_input_tokens
+            == src.prompt_tokens
+        )
 
-    def test_cache_read_populated_from_prompt_tokens_details(self):
-        """Prefix-cache hits surface as cache_read_input_tokens."""
+    def test_cache_read_subtracted_from_input(self):
+        """The core fix: prompt_tokens=120 with 80 cached must produce
+        input_tokens=40 (NOT 120) so downstream hit-rate math is correct."""
         src = UsageInfo(
             prompt_tokens=120,
             completion_tokens=30,
@@ -676,14 +699,32 @@ class TestBuildAnthropicUsage:
             prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=80),
         )
         usage = _build_anthropic_usage(src)
-        assert usage.input_tokens == 120
-        assert usage.output_tokens == 30
+        assert usage.input_tokens == 40
         assert usage.cache_read_input_tokens == 80
-        # vLLM doesn't distinguish read-vs-create so this stays unset.
-        assert usage.cache_creation_input_tokens is None
+        assert usage.cache_creation_input_tokens == 0
+        # Partition invariant
+        assert (
+            usage.input_tokens
+            + usage.cache_creation_input_tokens
+            + usage.cache_read_input_tokens
+            == src.prompt_tokens
+        )
+
+    def test_full_prompt_cache_hit(self):
+        """Edge: cached == prompt_tokens (entire prompt was a cache hit)."""
+        src = UsageInfo(
+            prompt_tokens=200,
+            completion_tokens=10,
+            total_tokens=210,
+            prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=200),
+        )
+        usage = _build_anthropic_usage(src)
+        assert usage.input_tokens == 0
+        assert usage.cache_read_input_tokens == 200
 
     def test_prompt_tokens_details_empty_cached_field(self):
-        """prompt_tokens_details present but cached_tokens is None."""
+        """prompt_tokens_details present but cached_tokens is None →
+        no cache hit, all prompt is new input."""
         src = UsageInfo(
             prompt_tokens=120,
             completion_tokens=30,
@@ -692,7 +733,7 @@ class TestBuildAnthropicUsage:
         )
         usage = _build_anthropic_usage(src)
         assert usage.input_tokens == 120
-        assert usage.cache_read_input_tokens is None
+        assert usage.cache_read_input_tokens == 0
 
     def test_force_output_zero_on_stream_start(self):
         """message_start event must report output_tokens=0 even if the
@@ -708,3 +749,17 @@ class TestBuildAnthropicUsage:
         usage = _build_anthropic_usage(src)
         assert usage.input_tokens == 10
         assert usage.output_tokens == 0
+
+    def test_cached_greater_than_prompt_clamps_to_zero_input(self):
+        """Defensive: should never happen, but if upstream ever reports
+        cached > prompt the partition equation must still hold (input
+        floors at 0 rather than going negative)."""
+        src = UsageInfo(
+            prompt_tokens=100,
+            completion_tokens=5,
+            total_tokens=105,
+            prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=150),
+        )
+        usage = _build_anthropic_usage(src)
+        assert usage.input_tokens == 0
+        assert usage.cache_read_input_tokens == 150

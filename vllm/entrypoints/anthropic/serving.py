@@ -56,41 +56,63 @@ def _build_anthropic_usage(
 ) -> AnthropicUsage:
     """Translate vLLM's OpenAI-format ``UsageInfo`` into Anthropic's usage shape.
 
+    Anthropic semantics partition the prompt:
+
+        prompt_tokens == input_tokens
+                       + cache_creation_input_tokens
+                       + cache_read_input_tokens
+
+    ``input_tokens`` is the *new, uncached* portion only — clients
+    (including the official anthropic-sdk and any cache-aware billing
+    code) compute hit-rate as
+    ``cache_read / (input + cache_read)`` and expect ``input`` to NOT
+    include cached tokens.  vLLM's OpenAI-format ``prompt_tokens`` is
+    the FULL prompt, so we subtract the cached portion before assigning.
+
     Pulls ``prompt_tokens_details.cached_tokens`` (populated by the OpenAI
     chat serving when the engine runs with ``--enable-prompt-tokens-details``
     and the request hits the prefix cache) into Anthropic's standard
-    ``cache_read_input_tokens`` field so that callers using the anthropic
-    SDK see prefix-cache hits without having to poke at
-    ``prompt_tokens_details`` directly.
+    ``cache_read_input_tokens`` field.
 
     ``force_output_zero`` is used by the streaming ``message_start`` event,
     where Anthropic's protocol requires ``output_tokens=0`` on the first
     chunk even if the source happens to have a non-zero count.
 
-    ``cache_creation_input_tokens`` is intentionally left unset: vLLM's
-    prefix cache auto-populates on every forward pass, so there is no
-    observable distinction between "read from existing cache entry" and
-    "created a new cache entry on this request" at the request level.
-    Leaving the field ``None`` (unset) is honest.
+    ``cache_creation_input_tokens`` is set to 0: vLLM's prefix cache
+    auto-populates on every forward pass, but vLLM doesn't expose a
+    per-request "newly written to cache" counter, so we can't honestly
+    attribute cache creations.  Reporting 0 keeps the partition equation
+    valid (input + 0 + cache_read == prompt_tokens) and matches the
+    Anthropic-native shape clients expect (the field is present, not
+    ``null``).
     """
     if source_usage is None:
         return AnthropicUsage(
             input_tokens=0,
             output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
         )
 
-    cached = None
+    cached = 0
     details = getattr(source_usage, "prompt_tokens_details", None)
     if details is not None:
-        cached = getattr(details, "cached_tokens", None)
+        cached = getattr(details, "cached_tokens", None) or 0
+
+    prompt_tokens = source_usage.prompt_tokens or 0
+    # Defensive clamp: if some upstream version ever reports cached >
+    # prompt (shouldn't happen, but the partition equation must hold),
+    # fall back to attributing everything as cache_read.
+    new_input = max(0, prompt_tokens - cached)
 
     return AnthropicUsage(
-        input_tokens=source_usage.prompt_tokens,
+        input_tokens=new_input,
         output_tokens=(
             0
             if force_output_zero
             else (source_usage.completion_tokens or 0)
         ),
+        cache_creation_input_tokens=0,
         cache_read_input_tokens=cached,
     )
 
