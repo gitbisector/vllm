@@ -103,6 +103,8 @@ if TYPE_CHECKING:
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
+    VLLM_FASTSAFETENSORS_DRAFTER_TAP: bool = True
+    VLLM_FASTSAFETENSORS_DRAFTER_TAP_MAX_BYTES: int = 32 * 1024**3
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -951,6 +953,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at peak during loading.
     "VLLM_FASTSAFETENSORS_QUEUE_SIZE": lambda: int(
         os.getenv("VLLM_FASTSAFETENSORS_QUEUE_SIZE", "0")
+    ),
+    # Cache MTP-prefixed tensors during the main parallel-loader pass and
+    # serve them on the drafter pass. Skips a second 23-shard load on V4
+    # Flash (~95 s saved on dual DGX Spark). Set to "0" to disable.
+    "VLLM_FASTSAFETENSORS_DRAFTER_TAP": lambda: bool(
+        int(os.getenv("VLLM_FASTSAFETENSORS_DRAFTER_TAP", "1"))
+    ),
+    # Safety cap on the drafter-tap cache. If teeing would exceed this
+    # many bytes, the cache is abandoned and the drafter falls back to a
+    # normal load. Default 32 GiB.
+    "VLLM_FASTSAFETENSORS_DRAFTER_TAP_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_FASTSAFETENSORS_DRAFTER_TAP_MAX_BYTES",
+                  str(32 * 1024**3))
     ),
     # Time in ms for the zmq client to wait for a response from the backend
     # server for simple data operations

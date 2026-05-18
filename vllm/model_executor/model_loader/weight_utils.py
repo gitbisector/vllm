@@ -1128,6 +1128,41 @@ def runai_safetensors_weights_iterator(
         yield from tensor_iter
 
 
+# ---------------------------------------------------------------------------
+# Drafter (MTP) tap cache.
+#
+# When the main model is loaded via fastsafetensors_weights_iterator(), we tee
+# any weights whose key matches a drafter prefix into a process-local cache.
+# On the subsequent drafter (e.g. DeepSeek V4 MTP) load -- which shares the
+# same safetensors files but only needs ~1.8 GB / rank of weights -- the
+# drafter pass detects the populated cache and serves directly from it, with
+# no second ParallelLoader run.
+#
+# Empirically this saves ~95 s of wall time on DeepSeek V4 Flash startup on
+# dual DGX Spark, where a second full 23-shard pass would otherwise dominate
+# the drafter load. See VLLM_FASTSAFETENSORS_DRAFTER_TAP env var to disable.
+#
+# Module-level globals are safe here because vLLM's multi-process executor
+# gives each worker its own Python process; the cache lives entirely within
+# the lifetime of a single worker.
+# ---------------------------------------------------------------------------
+_DRAFTER_TAP_CACHE: "dict[str, torch.Tensor]" = {}
+_DRAFTER_TAP_BYTES: int = 0
+_DRAFTER_TAP_PREFIXES: tuple[str, ...] = ("mtp.", "model.mtp.")
+
+
+def _is_drafter_tap_name(name: str) -> bool:
+    return name.startswith(_DRAFTER_TAP_PREFIXES)
+
+
+def reset_drafter_tap_cache() -> None:
+    """Drop the drafter tap cache. Call after a failed main load or before a
+    fresh re-load. Idempotent."""
+    global _DRAFTER_TAP_BYTES
+    _DRAFTER_TAP_CACHE.clear()
+    _DRAFTER_TAP_BYTES = 0
+
+
 def fastsafetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -1140,7 +1175,32 @@ def fastsafetensors_weights_iterator(
     Uses ParallelLoader for pipelined loading: the producer thread
     prepares metadata for the next shard while the consumer yields
     tensors from the current shard.
+
+    When VLLM_FASTSAFETENSORS_DRAFTER_TAP is enabled (default), drafter-prefix
+    tensors are tee'd into a process-local cache during the main pass and
+    served from there on the next call, skipping a redundant full-shard pass.
     """
+    global _DRAFTER_TAP_BYTES
+
+    # Serve-from-cache fast path: cache is populated, so this is the drafter
+    # pass. Filter still applies in case the drafter only wants a subset.
+    if _DRAFTER_TAP_CACHE:
+        consumed = 0
+        for name, tensor in list(_DRAFTER_TAP_CACHE.items()):
+            if _should_skip_safetensors_weight(
+                name, local_expert_ids, weight_name_filter
+            ):
+                continue
+            consumed += 1
+            yield name, tensor
+        logger.info(
+            "fastsafetensors drafter-tap cache hit: served %d tensors (%.2f GiB)",
+            consumed,
+            _DRAFTER_TAP_BYTES / (1024**3),
+        )
+        reset_drafter_tap_cache()
+        return
+
     from fastsafetensors.parallel_loader import ParallelLoader
 
     if torch.distributed.is_initialized():
@@ -1185,8 +1245,28 @@ def fastsafetensors_weights_iterator(
             nogds=nogds,
         )
 
+    tap_enabled = envs.VLLM_FASTSAFETENSORS_DRAFTER_TAP
+    tap_cap_bytes = envs.VLLM_FASTSAFETENSORS_DRAFTER_TAP_MAX_BYTES
+    tap_overflowed = False
+
     try:
         for k, t in pl.iterate_weights():
+            # Tee drafter-prefix tensors so the next drafter pass can skip its
+            # own ParallelLoader run. Clone so the gbuf is free to be reused.
+            if tap_enabled and not tap_overflowed and _is_drafter_tap_name(k):
+                t_bytes = t.element_size() * t.numel()
+                if _DRAFTER_TAP_BYTES + t_bytes > tap_cap_bytes:
+                    logger.warning(
+                        "fastsafetensors drafter-tap exceeded cap of %.1f GiB; "
+                        "abandoning cache. Set VLLM_FASTSAFETENSORS_"
+                        "DRAFTER_TAP_MAX_BYTES higher or =0 to disable.",
+                        tap_cap_bytes / (1024**3),
+                    )
+                    reset_drafter_tap_cache()
+                    tap_overflowed = True
+                else:
+                    _DRAFTER_TAP_CACHE[k] = t.clone()
+                    _DRAFTER_TAP_BYTES += t_bytes
             if _should_skip_safetensors_weight(
                 k,
                 local_expert_ids,
@@ -1196,6 +1276,13 @@ def fastsafetensors_weights_iterator(
             yield k, t
     finally:
         pl.close()
+    if tap_enabled and not tap_overflowed and _DRAFTER_TAP_CACHE:
+        logger.debug(
+            "fastsafetensors drafter-tap cached %d tensors (%.2f GiB) "
+            "from main pass for drafter reuse",
+            len(_DRAFTER_TAP_CACHE),
+            _DRAFTER_TAP_BYTES / (1024**3),
+        )
 
 
 def instanttensor_weights_iterator(
