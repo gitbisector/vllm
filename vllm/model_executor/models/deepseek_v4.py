@@ -1454,6 +1454,13 @@ class DeepseekV4Model(nn.Module):
 
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
+        # Bucket expert_mapping by expert_id so per-tensor lookup is O(small)
+        # instead of O(len(expert_mapping)). On V4 Flash with 256 routed
+        # experts × 3 weight types, this reduces the inner loop from ~768
+        # iterations per yielded expert tensor to ~3-6.
+        expert_mapping_by_id: dict[int, list[tuple[str, str, int, str]]] = {}
+        for _entry in expert_mapping:
+            expert_mapping_by_id.setdefault(_entry[2], []).append(_entry)
 
         for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1482,7 +1489,19 @@ class DeepseekV4Model(nn.Module):
                         and loaded_weight.dtype == torch.float8_e8m0fnu
                     ):
                         loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
+                    # O(1) expert lookup: extract expert_id from the
+                    # checkpoint name, then only iterate the few mappings
+                    # for that expert. Falls back to a full scan if the
+                    # regex doesn't match (defensive against unexpected
+                    # name shapes).
+                    _m = _EXPERT_INDEX_RE.search(name)
+                    if _m is not None:
+                        _candidates = expert_mapping_by_id.get(
+                            int(_m.group(1)), expert_mapping
+                        )
+                    else:
+                        _candidates = expert_mapping
+                    for mapping in _candidates:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
@@ -1547,6 +1566,14 @@ class DeepseekV4Model(nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
+
+
+# Compiled once at import: extracts the routed-expert index from a checkpoint
+# weight name like `model.layers.7.mlp.experts.42.w1.weight`. Used by
+# load_weights() to bucket expert_mapping by expert_id so per-tensor lookups
+# are O(1) over a small list instead of O(N_experts × N_weight_types) linear
+# scans.
+_EXPERT_INDEX_RE = __import__("re").compile(r"\.experts\.(\d+)\.")
 
 
 @torch.compile(backend=current_platform.simple_compile_backend)
