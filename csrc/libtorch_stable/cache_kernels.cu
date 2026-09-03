@@ -234,35 +234,6 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
     return;
   }
 #endif
-  {
-    // Fallback for CUDA < 12.8, older CUDA drivers, and ROCm < 7.1:
-    // individual async copies. cudaMemcpyDefault lets the driver infer
-    // direction from pointer types.
-    for (int64_t i = 0; i < n; i++) {
-      cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
-                      reinterpret_cast<void*>(src_data[i]),
-                      static_cast<size_t>(size_data[i]), cudaMemcpyDefault,
-                      stream);
-    }
-  #elif defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
-    // ROCm 7.1+ exposes hipMemcpyBatchAsync. The 7.2.1 implementation early-
-    // returns hipErrorNotSupported whenever numAttrs > 0 (see ROCm/clr @
-    // rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so call with
-    // numAttrs=0.
-    {
-      hipMemcpyAttributes attr = {};
-      size_t attrs_idx = 0;
-      size_t fail_idx = 0;
-      hipError_t result = hipMemcpyBatchAsync(
-          reinterpret_cast<void**>(dst_data), reinterpret_cast<void**>(src_data),
-          reinterpret_cast<size_t*>(size_data), static_cast<size_t>(n), &attr,
-          &attrs_idx, 0, &fail_idx, static_cast<hipStream_t>(stream));
-      STD_TORCH_CHECK(result == hipSuccess,
-                      "hipMemcpyBatchAsync failed at index ", fail_idx,
-                      " with error ", result);
-      return;
-    }
-  #endif
   }
   // Fallback for CUDA < 12.8, older CUDA drivers, ROCm < 7.1, or when
   // use_batch_api is false: individual async copies. cudaMemcpyDefault lets
