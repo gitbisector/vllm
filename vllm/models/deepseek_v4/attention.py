@@ -29,7 +29,6 @@ from vllm.models.deepseek_v4.common.ops import (
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 
 if TYPE_CHECKING:
-    from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
     )
@@ -56,6 +55,7 @@ from vllm.utils.multi_stream_utils import (
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
+    dsa_indexer_uses_fp4,
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
@@ -214,7 +214,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
-        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -300,7 +299,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
-        self.eager_scratch_pool = eager_scratch_pool
 
         self.indexer = None
         if self.compress_ratio == 4:
@@ -322,8 +320,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
-                eager_scratch_pool=eager_scratch_pool,
             )
+
+        self._prepare_and_attn_fn = self._prepare_and_attn
+        if not vllm_config.use_v2_model_runner:
+            # MRV1's piecewise capture only tolerates the wide eager region: with
+            # the narrow one the attention input preparation stays in the captured
+            # graph and MRV1 produces garbage (#51430).
+            self._prepare_and_attn_fn = self._prepare_and_attn_eager
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
@@ -378,7 +382,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 rotate=True,
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
-                eager_scratch_pool=eager_scratch_pool,
             )
 
     @staticmethod
@@ -498,6 +501,64 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
         )
 
+        self._prepare_and_attn_fn(
+            hidden_states,
+            qr,
+            kv,
+            kv_score,
+            indexer_kv_score,
+            indexer_weights,
+            positions,
+            o_padded,
+        )
+        o = o_padded[:, : self.n_local_heads, :]
+
+        # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
+        return self._o_proj(o, positions)
+
+    @eager_break_during_capture
+    def _prepare_and_attn_eager(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        kv_score: torch.Tensor,
+        indexer_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        o_padded: torch.Tensor,
+    ) -> None:
+        """Wide eager region: the whole of ``_prepare_and_attn`` runs eagerly.
+
+        The nested ``_sparse_indexer_and_attn`` break runs inline, since
+        ``add_eager`` clears ``_capturing`` before invoking this.
+        """
+        self._prepare_and_attn(
+            hidden_states,
+            qr,
+            kv,
+            kv_score,
+            indexer_kv_score,
+            indexer_weights,
+            positions,
+            o_padded,
+        )
+
+    def _prepare_and_attn(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        kv_score: torch.Tensor,
+        indexer_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        o_padded: torch.Tensor,
+    ) -> None:
+        """Attention input preparation followed by the sparse indexer and MLA.
+
+        Only the latter runs in the eager break.
+        """
         attn_metadata = get_forward_context().attn_metadata
         indexer = self.indexer
         compressor = self.compressor
@@ -557,10 +618,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             positions,
             o_padded,
         )
-        o = o_padded[:, : self.n_local_heads, :]
-
-        # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
-        return self._o_proj(o, positions)
 
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Override point: the ROCm layer preshuffles this weight in place, so
@@ -700,6 +757,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
             #            the padding head slots into a reusable q buffer.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
+            #
+            # MERGE-NOTE (2026-09-03): kept HEAD's pool-aware _out variant.
+            # Upstream deleted eager_scratch.py and the pool entirely (its
+            # attention.py still references self.eager_scratch_pool defensively
+            # -- see global_topk_outputs -- but never constructs one, so it's
+            # always None there). Kept here because jasl's pool is already
+            # opt-in/off-by-default (VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL) with a
+            # documented, still-partial correctness caveat (d42b8d9f55,
+            # 4450216c9e) -- keeping it changes no default behavior and
+            # preserves the option. fix_functionalization.py already special-
+            # cases the _out op by name, so it's still a live, registered op.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
             # Writing Q in place is free whenever padded_heads == n_local_heads,
             # which holds on SM12x TP=2, so prefer it over any scratch buffer.
@@ -733,7 +801,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # per-tensor fp8 writes a separately-allocated fp8 q and quantizes the
         # KV row.
         block_size = swa_metadata.block_size
-        swa_kv_cache_3d = swa_kv_cache.view(-1, block_size, self.head_dim)
+        assert swa_kv_cache.shape[1:] == (block_size, self.head_dim)
+        swa_kv_cache_3d = swa_kv_cache
         if cache_dtype == torch.bfloat16:
             torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
                 q,
@@ -771,6 +840,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return None
         return self.eager_scratch_pool.global_topk_outputs(topk_indices)
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
@@ -788,11 +861,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token;
+            # head_size stays semantic (512).
+            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
         )
 
 
@@ -817,16 +893,20 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # head_dim already carries the fp8 scale padding
-        # compress_ratio=1 for V3.2, >1 for DeepseekV4; both use the same cache layout.
+        # tokens_per_state=1 for V3.2, >1 for DeepseekV4; same cache layout.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            compress_ratio=self.compress_ratio,
+            tokens_per_state=self.compress_ratio,
             # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
             alignment=576 if uses_fp8_ds_mla_layout else 512,
         )
@@ -850,7 +930,6 @@ class DeepseekV4Indexer(nn.Module):
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
-        eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -863,8 +942,7 @@ class DeepseekV4Indexer(nn.Module):
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
         self.compress_ratio = compress_ratio
-        self.eager_scratch_pool = eager_scratch_pool
-        self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
+        self.use_fp4_kv = dsa_indexer_uses_fp4(vllm_config)
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
             "MXFP4" if self.use_fp4_kv else "FP8",
@@ -927,7 +1005,6 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.compressor",
             k_cache_prefix=self.k_cache.prefix,
             use_fp4_cache=self.use_fp4_kv,
-            eager_scratch_pool=eager_scratch_pool,
         )
 
         self.indexer_op = SparseAttnIndexer(
@@ -941,6 +1018,7 @@ class DeepseekV4Indexer(nn.Module):
             self.topk_indices_buffer,
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
+            compress_ratio=self.compress_ratio,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
@@ -964,7 +1042,10 @@ class DeepseekV4Indexer(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
-            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
+            if (
+                indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
+                and not torch.cuda.is_current_stream_capturing()
+            ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
                 compressor(compressed_kv_score, positions, rotary_emb)
@@ -988,9 +1069,6 @@ class DeepseekV4Indexer(nn.Module):
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
-            outputs = None
-            if self.eager_scratch_pool is not None and self.use_fp4_kv:
-                outputs = self.eager_scratch_pool.indexer_q_outputs(q.shape[0])
             return fused_indexer_q_rope_quant(
                 positions,
                 q,
@@ -999,7 +1077,6 @@ class DeepseekV4Indexer(nn.Module):
                 self.softmax_scale,
                 self.n_head**-0.5,
                 use_fp4=self.use_fp4_kv,
-                output_buffers=outputs,
             )
 
         # compressor returns None and writes K to the indexer KV cache; the

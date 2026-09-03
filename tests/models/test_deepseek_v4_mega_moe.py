@@ -10,10 +10,14 @@ from vllm.config import CompilationConfig
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     bind_routed_experts_capturer,
 )
+from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4.nvidia.model import (
+    DeepseekV4ForCausalLM,
     DeepseekV4MegaMoEExperts,
+    DeepseekV4MoE,
     make_deepseek_v4_expert_params_mapping,
 )
+from vllm.models.deepseek_v4.nvidia.mtp import DeepSeekV4MTP
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.utils import deep_gemm as deep_gemm_utils
@@ -306,6 +310,125 @@ def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
         fused_topk_weights.view(torch.uint8),
         ref_topk_weights.view(torch.uint8),
     )
+
+
+@pytest.mark.parametrize("shared_block_m", [8, 32, 96, 128, 192])
+def test_deepseek_v4_mega_moe_stages_shared_scale_tma_layout(shared_block_m):
+    from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8
+
+    device = torch.device("cuda")
+    num_tokens = shared_block_m + 7
+    hidden_size = 256
+    top_k = 8
+    generator = torch.Generator(device=device)
+    generator.manual_seed(shared_block_m)
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    topk_ids = torch.randint(
+        0,
+        256,
+        (num_tokens, top_k),
+        device=device,
+        dtype=torch.int32,
+        generator=generator,
+    )
+    topk_weights = torch.randn(
+        num_tokens,
+        top_k,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    ref_x, ref_x_sf = per_token_cast_to_fp8(
+        hidden_states,
+        use_ue8m0=True,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    )
+    aligned_block_m = ((shared_block_m + 127) // 128) * 128
+    num_shared_rows = ((num_tokens + shared_block_m - 1) // shared_block_m) * (
+        aligned_block_m
+    )
+    ref_shared_x_sf = torch.zeros(
+        num_shared_rows,
+        hidden_size // 128,
+        dtype=torch.int32,
+        device=device,
+    )
+    for token_id in range(num_tokens):
+        m_in_block = token_id % shared_block_m
+        transposed_m = (
+            (m_in_block // 128) * 128 + (m_in_block % 32) * 4 + (m_in_block % 128) // 32
+        )
+        shared_row = token_id // shared_block_m * aligned_block_m + transposed_m
+        ref_shared_x_sf[shared_row].copy_(ref_x_sf[token_id])
+
+    fused_x = torch.empty_like(ref_x)
+    fused_x_sf = torch.empty_like(ref_x_sf)
+    fused_shared_storage = torch.full(
+        (hidden_size // 128, num_shared_rows),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    fused_shared_x_sf = fused_shared_storage.t()
+    fused_topk_idx = torch.empty_like(topk_ids, dtype=torch.int64)
+    fused_topk_weights = torch.empty_like(topk_weights)
+
+    prepare_megamoe_inputs(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        fused_x,
+        fused_x_sf,
+        fused_topk_idx,
+        fused_topk_weights,
+        shared_x_sf=fused_shared_x_sf,
+        shared_block_m=shared_block_m,
+    )
+    torch.accelerator.synchronize()
+
+    populated = ref_shared_x_sf != 0
+    assert torch.equal(fused_x.view(torch.uint8), ref_x.view(torch.uint8))
+    assert torch.equal(fused_x_sf, ref_x_sf)
+    assert torch.equal(fused_shared_x_sf[populated], ref_shared_x_sf[populated])
+
+
+def test_deepseek_v4_pwal_hook_finalizes_mega_moe_and_mhc_broadcast():
+    """The loader invokes the model-level PWAL hook for every load format,
+    so it must finalize megamoe + mhc broadcast weights to cover dummy
+    load, which skips load_weights()."""
+    calls = []
+    stub = SimpleNamespace(
+        model=SimpleNamespace(
+            finalize_mega_moe_weights=lambda: calls.append("mega_moe"),
+            finalize_mhc_broadcast_weights=lambda: calls.append("mhc"),
+        )
+    )
+
+    DeepseekV4ForCausalLM.process_weights_after_loading(stub)
+
+    assert calls == ["mega_moe", "mhc"]
+
+
+def test_deepseek_v4_drafter_pwal_hooks_finalize_mega_moe():
+    """MTP/DSpark drafters load as their own top-level models, so each needs
+    its own PWAL hook now that the megamoe forward no longer finalizes
+    weights lazily on first use."""
+    calls = []
+    mtp = SimpleNamespace(finalize_mega_moe_weights=lambda: calls.append("mtp"))
+    DeepSeekV4MTP.process_weights_after_loading(mtp)
+
+    dspark = SimpleNamespace(_finalize_moe=lambda: calls.append("dspark"))
+    DSparkDeepseekV4ForCausalLM.process_weights_after_loading(dspark)
+
+    assert calls == ["mtp", "dspark"]
 
 
 @pytest.mark.skipif(

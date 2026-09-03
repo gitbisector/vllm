@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.nn as nn
 
 import vllm.model_executor.kernels.mhc  # noqa: F401
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -12,6 +15,10 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_fused_post_pre_tilelang_reuse_residual,
 )
 from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
+from vllm.models.deepseek_v4.nvidia.model import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4Model,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 

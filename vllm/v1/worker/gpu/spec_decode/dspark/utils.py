@@ -3,13 +3,32 @@
 
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import ModelConfig, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.model_executor.model_loader import get_model
-from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
-    _should_share,
-    get_target_lm_head,
-)
+from vllm.logger import init_logger
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+logger = init_logger(__name__)
+
+
+def _resolve_dspark_attention_backend(
+    draft_model_config: ModelConfig,
+    draft_backend: AttentionBackendEnum | None,
+    target_backend: AttentionBackendEnum | None,
+) -> AttentionBackendEnum | None:
+    if draft_backend is not None:
+        return draft_backend
+    # DeepSeek-V4 draft layers share the target's KV-cache layout. Other
+    # DSpark architectures may use a different attention kind.
+    if draft_model_config.hf_config.model_type == "deepseek_v4":
+        if target_backend is not None:
+            logger.info_once(
+                "Using the target model's %s attention backend for the "
+                "DeepSeek-V4 DSpark drafter.",
+                target_backend.name,
+            )
+        return target_backend
+    return None
 
 
 def _inner_model(model: nn.Module) -> nn.Module:
@@ -32,15 +51,26 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_model_config = speculative_config.draft_model_config
 
     from vllm.compilation.backends import set_model_tag
+    from vllm.model_executor.model_loader import get_model
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
     from vllm.model_executor.models.utils import get_draft_quant_config
+    from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+        _should_share,
+        get_target_lm_head,
+    )
+
+    draft_attention_backend = _resolve_dspark_attention_backend(
+        draft_model_config,
+        speculative_config.attention_backend,
+        vllm_config.attention_config.backend,
+    )
 
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
-            backend=speculative_config.attention_backend,
+            backend=draft_attention_backend,
         ),
         cache_config=(
             replace(
@@ -75,24 +105,47 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
+    # MERGE-NOTE (2026-09-03): kept HEAD's _inner_model() helper (getattr(m,
+    # "model", m)) over upstream's plain ".model" access -- upstream's DSpark
+    # class is nested (self.model.foo), jasl's is flat (self.foo per the
+    # eager_scratch.py / dspark.py "this class is flat" note), and _inner_model
+    # handles both. Combined with upstream's target_vocab_size, which the
+    # unconflicted embed-sharing check right below already depends on.
     target_inner = _inner_model(target_language_model)
     draft_inner = _inner_model(draft_model)
+    target_vocab_size = vllm_config.model_config.get_vocab_size()
 
     target_embed = getattr(target_inner, "embed_tokens", None)
     draft_embed = getattr(draft_inner, "embed_tokens", None)
-    if target_embed is not None and _should_share(
-        draft_model, "has_own_embed_tokens", draft_embed, target_embed
+    if (
+        target_embed is not None
+        and draft_model_config.get_vocab_size() <= target_vocab_size
+        and _should_share(
+            draft_model, "has_own_embed_tokens", draft_embed, target_embed
+        )
     ):
         if draft_embed is not None:
             del draft_inner.embed_tokens
         draft_inner.embed_tokens = target_embed
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
+    # MERGE-NOTE (2026-09-03): kept HEAD's _find_module_attr (searches both
+    # "lm_head" and "head" attribute names; the unconflicted code right below
+    # destructures draft_head_owner/draft_head_name, which only this 3-tuple
+    # form produces) and added upstream's vocab-size guard, which HEAD's
+    # version was missing -- without it, sharing an lm_head across mismatched
+    # vocab sizes would silently produce wrong-shape logits.
     draft_head_owner, draft_head_name, draft_lm_head = _find_module_attr(
         draft_model, "lm_head", "head"
     )
-    if target_lm_head is not None and _should_share(
-        draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
+    draft_output_vocab_size = (
+        getattr(draft_model_config.hf_config, "draft_vocab_size", None)
+        or draft_model_config.get_vocab_size()
+    )
+    if (
+        target_lm_head is not None
+        and draft_output_vocab_size == target_vocab_size
+        and _should_share(draft_model, "has_own_lm_head", draft_lm_head, target_lm_head)
     ):
         if draft_lm_head is not None:
             delattr(draft_head_owner, draft_head_name)
