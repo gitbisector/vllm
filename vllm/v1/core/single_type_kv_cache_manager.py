@@ -2271,11 +2271,6 @@ def register_all_kvcache_specs(vllm_config):
 
     # FullAttentionSpec subclasses — grouped with FullAttentionSpec
     KVCacheSpecRegistry.register(
-        TQFullAttentionSpec,
-        FullAttentionManager,
-        uniform_type_base_spec=FullAttentionSpec,
-    )
-    KVCacheSpecRegistry.register(
         # MERGE-NOTE (2026-09-03): kept MLAAttentionManager (not upstream's
         # plain FullAttentionManager) -- it carries the same-step ghost-block
         # defer guard (VLLM_ALLOW_SPEC_DEC_SAME_STEP_PREFIX_HIT /
