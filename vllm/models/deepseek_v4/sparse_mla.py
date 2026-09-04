@@ -326,12 +326,12 @@ def build_c128a_topk_metadata(
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
     assert max_compressed_tokens % _C128A_TOPK_ALIGNMENT == 0
-    assert (
-        0
-        < max_compressed_tokens
-        <= min(global_decode_buffer.shape[1], prefill_buffer.shape[1])
-    )
-    assert global_decode_buffer.stride(-1) == prefill_buffer.stride(-1) == 1
+    # The flat-view-then-reshape below only preserves row boundaries when
+    # max_compressed_tokens is exactly the packed buffer's row width -- a
+    # narrower width would carve decode/prefill regions across partial rows
+    # of the original (num_tokens, row_width) buffer instead of whole rows.
+    assert max_compressed_tokens == topk_buffer.shape[1]
+    assert topk_buffer.stride(-1) == 1
 
     # view(-1) as a 1-d array, then carve out the two packed row ranges.
     flat = topk_buffer.view(-1)
