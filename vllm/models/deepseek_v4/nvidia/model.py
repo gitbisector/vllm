@@ -740,6 +740,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
 
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+
         symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
         is_padding = None
