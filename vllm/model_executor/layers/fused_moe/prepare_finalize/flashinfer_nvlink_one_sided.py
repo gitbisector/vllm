@@ -9,10 +9,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.fused_moe.utils import (
-    moe_kernel_quantize_input,
-    restore_dispatched_scale_layout,
-)
+from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
 def get_local_sizes():
@@ -126,15 +124,13 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
             expert_id_payload_index=topk_ids_payload_index,
         )
-        # MERGE-FLAG (2026-09-03, dsv4-b12x-rebase): took upstream's version
-        # -- HEAD's side produced a1q_recv/a1q_scale_recv, but the rest of this
-        # function (return statement, else branch below) already only knows
-        # recv_x/recv_x_sf, so HEAD's variant would NameError. Not verified:
-        # whether MXFP4 (DeepSeek-V4-Flash's format, distinct from the nvfp4
-        # this branch special-cases) needs the same scale restore jasl's
-        # generic restore_dispatched_scale_layout call used to provide on this
-        # one-sided NVLink dispatch path -- check before trusting MoE output
-        # correctness here if this path is actually exercised for DSv4.
+        # MERGE-NOTE (2026-09-03, dsv4-b12x-rebase): this block is upstream's
+        # (3454335f7b) nvfp4-only interleave. jasl's 9ad62027bc instead called
+        # the generic restore_dispatched_scale_layout() here (which also
+        # handles mxfp8, as two_sided.py does); that variant used pre-rename
+        # names (a1q_recv, self.scale_elems_per_token) and was not carried
+        # over. Only reached with the flashinfer_nvlink_one_sided all2all
+        # backend under EP/DP.
         if dispatch_x_sf is not None:
             recv_x, recv_x_sf, topk_ids_recv, topk_weights_recv = recv_payloads
             x_sf_width = recv_x_sf.shape[-1]
