@@ -1460,62 +1460,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
-        n_local_heads = (
-            config.num_attention_heads // get_tensor_model_parallel_world_size()
-        )
-        padded_heads = _select_dsv4_attn_cls(vllm_config).get_padded_num_q_heads(
-            n_local_heads
-        )
-        # The eager scratch pool is OFF by default: it corrupts output under
-        # concurrent mixed prefill+decode.
-        #
-        # Reported with a clean bisect on vllm-project/vllm#41834 (tobymao,
-        # TP=4 SM12x, 1M context) -- leaked BOS tokens mid-sentence, multilingual
-        # token salad, terminal single-token repetition; pool active 7/7 rounds
-        # corrupt, pool disabled 0/2, pre-pool build 0/2, and it reproduces with
-        # speculative decoding both on and off.
-        #
-        # There are TWO races, and only one is fixed. The cross-TEMPLATE aliasing
-        # (all three families carved from offset 0) is gone -- see the sum()
-        # sizing in eager_scratch.py. But each template is still shared across all
-        # 43 layers: compressor_scratch()/indexer_q_outputs()/global_topk_outputs()
-        # hand every layer a view of the SAME buffer, keyed only by num_tokens. The
-        # attention eager break runs the indexer and compressor on parallel aux
-        # streams, so layer N's consumer can still be reading while layer N+1
-        # writes. The reporter tested the sum() fix specifically and still saw 1
-        # corrupt round in 2; with the pool disabled, 2/2 clean, which is what they
-        # now run in production.
-        #
-        # Making it safe needs per-layer buffers (43x the footprint) or explicit
-        # stream-ordering events. Until then the pool is opt-in.
-        #
-        # What OFF costs us: on the default SM12x path allocate_q is already False
-        # (attention writes Q in place), so the 256 MiB Q buffer this pool exists
-        # to manage is not allocated either way. Only the ~36 MiB of aux views stop
-        # being pooled -- allocator churn, not capacity.
-        self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
-        if (
-            not vllm_config.parallel_config.use_ubatching
-            and envs.VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL
-        ):
-            # TODO: support dbo if needed
-            # this requires the buffer to have ubatch dim
-            self.eager_scratch_pool = DeepseekV4EagerScratchPool(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                padded_heads,
-                config.head_dim,
-                config.index_n_heads,
-                config.index_head_dim,
-                config.index_topk,
-                current_platform.device_type,
-                # Same predicate as DeepseekV4Attention._qnorm_rope_can_write_inplace,
-                # evaluated on the same two model-wide quantities: when Q needs no
-                # padding, attention writes it in place and the pool's Q buffer is
-                # never read. True on the default SM12x path (the FlashInfer-SM120
-                # decode class pads to {16,32,64,128}, so 64/TP maps to itself);
-                # false on the FlashMLA class, which pads everything to 64.
-                allocate_q=padded_heads != n_local_heads,
-            )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
