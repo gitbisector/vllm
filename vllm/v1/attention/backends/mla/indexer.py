@@ -1073,6 +1073,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # exclude. Kept upstream's "metadata = ..." variable-assignment
             # style (not HEAD's in-place buffer write) since the unconflicted
             # code right after this hunk already references a local "metadata".
+            schedule_metadata = self.scheduler_metadata_buffer
             if _uses_deep_gemm_scheduler_metadata():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
