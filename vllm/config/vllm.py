@@ -84,16 +84,6 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
 # Architectures that lack @support_torch_compile and are known-good under
 # breakable cudagraph. DeepSeek-V4 is deliberately absent -- see
 # _should_auto_enable_breakable_cudagraph for the measurement.
-#
-# MERGE-FLAG (2026-09-03, dsv4-b12x-rebase): upstream independently added its
-# own breakable-cudagraph auto-enable mechanism (DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
-# / default_breakable_cudagraph_architectures() / _uses_breakable_cudagraph_by_default()
-# / _maybe_enable_breakable_cudagraph(), further down in this file) whose default
-# set INCLUDES DeepSeekV4ForCausalLM -- the opposite of this set's deliberate
-# exclusion. Both mechanisms now coexist unreconciled. Need to verify which one
-# actually gates cudagraph mode at engine init and confirm DeepSeek-V4 doesn't
-# get auto-enabled via upstream's path, bypassing this fork's measurement-based
-# exclusion, before trusting cudagraph behavior on DSv4 in the rebased tree.
 _BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES = frozenset(
     {
         "InklingForCausalLM",
