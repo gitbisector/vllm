@@ -599,19 +599,8 @@ def compute_global_topk_indices_and_lens(
     3. Masking padding tokens to length 0
     """
     num_tokens = topk_indices.shape[0]
-    if output_buffers is None:
-        global_topk_indices = torch.empty_like(topk_indices)
-        topk_lens = torch.empty(
-            num_tokens, dtype=torch.int32, device=topk_indices.device
-        )
-    else:
-        global_topk_indices, topk_lens = output_buffers
-        assert global_topk_indices.shape == topk_indices.shape
-        assert global_topk_indices.dtype == topk_indices.dtype
-        assert global_topk_indices.device == topk_indices.device
-        assert topk_lens.shape == (num_tokens,)
-        assert topk_lens.dtype == torch.int32
-        assert topk_lens.device == topk_indices.device
+    global_topk_indices = torch.empty_like(topk_indices)
+    topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
         global_topk_indices.stride(0),
