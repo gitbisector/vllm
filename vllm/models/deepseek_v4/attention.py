@@ -757,35 +757,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
             #            the padding head slots into a reusable q buffer.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
-            #
-            # MERGE-NOTE (2026-09-03): kept HEAD's pool-aware _out variant.
-            # Upstream deleted eager_scratch.py and the pool entirely (its
-            # attention.py still references self.eager_scratch_pool defensively
-            # -- see global_topk_outputs -- but never constructs one, so it's
-            # always None there). Kept here because jasl's pool is already
-            # opt-in/off-by-default (VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL) with a
-            # documented, still-partial correctness caveat (d42b8d9f55,
-            # 4450216c9e) -- keeping it changes no default behavior and
-            # preserves the option. fix_functionalization.py already special-
-            # cases the _out op by name, so it's still a live, registered op.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            # Writing Q in place is free whenever padded_heads == n_local_heads,
-            # which holds on SM12x TP=2, so prefer it over any scratch buffer.
-            # Otherwise reuse upstream's eager-break pool when present, and fall
-            # back to our own class scratch. All three satisfy the op's
-            # q_out.size(1) == q_head_padded contract: _select_dsv4_attn_cls
-            # yields one attention class model-wide, so the pool's
-            # padded_q_heads equals every layer's self.padded_heads.
-            if self._qnorm_rope_can_write_inplace():
-                q_out = q
-            elif self.eager_scratch_pool is not None:
-                q_out = self.eager_scratch_pool.q_out(q.shape[0])
-            else:
-                q_out = self._get_q_padded_scratch(q)
-            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
-                q_out,
                 swa_kv_cache_2d,
                 swa_metadata.slot_mapping,
                 positions,
@@ -794,7 +769,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 swa_metadata.block_size,
             )
-            return q_out
 
         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
         # row in its element dtype (no Q padding). bf16 rewrites q in place;
