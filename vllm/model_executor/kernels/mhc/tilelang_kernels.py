@@ -664,9 +664,7 @@ def mhc_post_tilelang(
             T.pdl_trigger()
 
 
-@tilelang.jit(
-    pass_configs=pass_configs,
-)
+@tilelang_jit
 def mhc_post_mean_tilelang(
     a,
     b,
@@ -1003,9 +1001,7 @@ def hc_head_fuse_tilelang(
             T.pdl_trigger()
 
 
-@tilelang.jit(
-    pass_configs=pass_configs,
-)
+@tilelang_jit
 def mhc_post_hc_head_tilelang(
     comb_mix,
     residual,
@@ -1134,9 +1130,7 @@ def mhc_post_hc_head_tilelang(
             T.pdl_trigger()
 
 
-@tilelang.jit(
-    pass_configs=pass_configs,
-)
+@tilelang_jit
 def mhc_post_mean_hc_head_tilelang(
     comb_mix,
     residual,
