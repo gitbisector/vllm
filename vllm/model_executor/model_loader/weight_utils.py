@@ -1311,14 +1311,15 @@ def _fastsafetensors_memory_budget(
     return (budget or None), reason
 
 
-def _safetensors_largest_tensor(
+def _safetensors_extents(
     hf_weights_files: list[str],
     keep_tensor: Callable[[str], bool] | None = None,
-) -> int:
-    """Largest single tensor across the shards, in bytes.
+) -> tuple[int, int]:
+    """Largest single tensor and largest per-shard kept span, in bytes.
 
-    The planner can split a shard but never a tensor, so this is the atomic
-    unit a chunk must be able to hold.
+    The planner can split a shard but never a tensor, so the largest tensor is
+    the atomic unit a chunk must be able to hold. The largest span is what a
+    whole-shard load of the biggest shard stages.
 
     Args:
         hf_weights_files: Safetensors files to scan.
@@ -1326,10 +1327,11 @@ def _safetensors_largest_tensor(
             same predicate: a tensor that is never read cannot constrain a chunk.
 
     """
-    largest = 0
+    largest = span = 0
     for path in hf_weights_files:
         with open(path, "rb") as f:
             header = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+        lo, hi = None, 0
         for name, meta in header.items():
             if name == "__metadata__":
                 continue
@@ -1337,7 +1339,40 @@ def _safetensors_largest_tensor(
                 continue
             start, end = meta["data_offsets"]
             largest = max(largest, end - start)
-    return largest
+            lo = start if lo is None else min(lo, start)
+            hi = max(hi, end)
+        if lo is not None:
+            span = max(span, hi - lo)
+    return largest, span
+
+
+def _fastsafetensors_needs_plan(
+    budget: int,
+    largest_span: int,
+    queue_size: int,
+    group_size: int,
+    accumulate_resident: bool,
+) -> bool:
+    """Whether the fit planner would change anything about this load.
+
+    Where the budget certainly covers whole-shard loads at full pipeline
+    depth, the plan is whole files at the requested depth -- the unplanned
+    load -- and planning only adds cost: the planner parses every header on
+    the main thread before the first read (~1 s on a 9-shard 35B checkpoint,
+    +15% load time), and its chunk cap would split shards that fit (17 chunks
+    instead of 9 files, +30%).
+
+    "Certainly" uses an upper bound on the planner's live buffers: the
+    pipeline depth for ``queue_size``, one receive buffer under broadcast,
+    each charged at most twice (the unified copier's pinned fallback), plus
+    one yielded-tensor clone. With resident growth the headroom shrinks by an
+    amount only the planner tracks, so such loads are always planned. Every
+    input is header-derived or already agreed, so all ranks decide alike.
+    """
+    if accumulate_resident:
+        return True
+    depth = (1 if queue_size < 0 else queue_size + 2) + (group_size > 1)
+    return largest_span * (2 * depth + 1) > budget
 
 
 def fastsafetensors_weights_iterator(
@@ -1429,6 +1464,24 @@ def fastsafetensors_weights_iterator(
     budget, budget_reason = _fastsafetensors_memory_budget(
         device, pg, derive=not accumulate_resident
     )
+    max_batch_bytes = None
+    if budget is not None:
+        largest_tensor, largest_span = _safetensors_extents(
+            hf_weights_files, keep_tensor
+        )
+        if _fastsafetensors_needs_plan(
+            budget, largest_span, queue_size, pg.size(), accumulate_resident
+        ):
+            # A chunk must hold the largest tensor, since a shard can be split
+            # but a tensor cannot; twice that lets the producer read ahead,
+            # and bounds staging at depth x cap rather than at the budget.
+            max_batch_bytes = 2 * largest_tensor or None
+        else:
+            budget_reason = (
+                f"whole shards fit in {budget / (1 << 30):.2f} GiB, "
+                f"{budget_reason} budget"
+            )
+            budget = None
     nogds = nogds or budget is not None
 
     def _make_loader(nogds: bool) -> "ParallelLoader":
@@ -1448,16 +1501,7 @@ def fastsafetensors_weights_iterator(
         try:
             return ParallelLoader(
                 device_memory_budget=budget,
-                # A chunk must hold the largest tensor, since a shard can be
-                # split but a tensor cannot; twice that bounds staging at
-                # eff_depth x cap rather than at the budget, which would
-                # otherwise reserve most of free memory however small the
-                # checkpoint. The cap only binds where it leaves the plan
-                # feasible, and stops binding once it exceeds the largest
-                # shard, where the plan is whole-file anyway.
-                max_batch_bytes=2
-                * _safetensors_largest_tensor(hf_weights_files, keep_tensor)
-                or None,
+                max_batch_bytes=max_batch_bytes,
                 **kwargs,
             )
         except BudgetInfeasibleError as e:

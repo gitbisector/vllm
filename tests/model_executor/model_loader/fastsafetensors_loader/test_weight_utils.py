@@ -9,11 +9,14 @@ import pytest
 import torch
 
 from vllm.model_executor.model_loader.weight_utils import (
+    _fastsafetensors_needs_plan,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.platforms import current_platform
+
+GiB = 1 << 30
 
 
 def _download_gpt2(tmpdir):
@@ -135,3 +138,32 @@ def test_fastsafetensors_accumulate_resident_skips_derived_budget(monkeypatch):
             )
         }
     assert names
+
+
+@pytest.mark.parametrize(
+    ("budget", "largest_span", "group_size", "resident", "plan"),
+    [
+        # Qwen3.6-35B-A3B-AWQ: 2.8 GiB shards, 85 GiB free. Every shard fits
+        # whole, so planning would only add header parsing and chunking.
+        (85 * GiB, 2.8 * GiB, 1, False, False),
+        # Muse-Glimmer-30B: a 46.5 GiB shard against 38 GiB free must chunk.
+        (38 * GiB, 46.5 * GiB, 1, False, True),
+        # Broadcast adds a receive buffer: 5 x 2.8 fits 16 GiB, 7 x 2.8 does not.
+        (16 * GiB, 2.8 * GiB, 1, False, False),
+        (16 * GiB, 2.8 * GiB, 2, False, True),
+        # Resident growth shrinks headroom by an amount only the planner knows.
+        (85 * GiB, 2.8 * GiB, 1, True, True),
+    ],
+)
+def test_fastsafetensors_needs_plan(budget, largest_span, group_size, resident, plan):
+    """The planner runs only where it would change the load."""
+    assert (
+        _fastsafetensors_needs_plan(
+            int(budget),
+            int(largest_span),
+            queue_size=0,
+            group_size=group_size,
+            accumulate_resident=resident,
+        )
+        is plan
+    )
