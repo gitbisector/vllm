@@ -163,6 +163,12 @@ class SparseIndexerTopk(torch.nn.Module):
             current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
+        # SM12x (GB10: 48 SMs, 99 KB smem per block): persistent_topk cannot
+        # launch on very wide rows and is slower than per_row where it runs
+        # (topk 512, 48 rows x 300K: 978 vs 513 us), so "auto" skips it there.
+        self._persistent_auto = self._is_cuda and (
+            not current_platform.is_device_capability_family(120)
+        )
 
     def resolve_backend(
         self, logits: torch.Tensor, topk_tokens: int, num_rows: int
@@ -220,11 +226,11 @@ class SparseIndexerTopk(torch.nn.Module):
 
         cooperative_topk is preferred whenever it is applicable, i.e. within
         its AUTO_COOPERATIVE_MAX_ROWS row limit; larger batches go to
-        persistent_topk.
+        persistent_topk (except on SM12x, which goes to per_row).
         """
         if not self._cooperative_constraints(logits, topk_tokens, num_rows):
             return "cooperative"
-        if self._is_cuda and topk_tokens in (512, 1024, 2048):
+        if self._persistent_auto and topk_tokens in (512, 1024, 2048):
             return "persistent"
         return "per_row"
 
