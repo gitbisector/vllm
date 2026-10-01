@@ -49,6 +49,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import get_dcp_world_size_and_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -549,6 +550,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "(the replayed tokens' slot padding knows the rank-local batch "
                 "only); the sliding-window cache takes part in prefix caching "
                 "instead."
+            )
+            swa_bounded_replay = False
+        # The process DCP group, not this config: a DSpark draft built at DCP1
+        # under a DCP target must keep the target's choice.
+        if swa_bounded_replay and get_dcp_world_size_and_rank()[0] > 1:
+            logger.warning_once(
+                "SWA bounded replay is off under decode context parallelism "
+                "(a replayed token's PAD slot is indistinguishable from the PAD "
+                "of a token another rank owns, so the state-sharded compressed "
+                "slot mapping cannot skip replayed states); the sliding-window "
+                "cache takes part in prefix caching instead."
             )
             swa_bounded_replay = False
         if swa_bounded_replay and current_platform.is_rocm():
