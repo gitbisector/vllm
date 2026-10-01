@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
-from typing import TYPE_CHECKING, ClassVar, cast
+import os
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.common.ops import (
@@ -37,9 +40,92 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_filter_and_convert_dcp_index,
+)
+from vllm.v1.attention.ops.dcp import (
+    _CORRECT_ATTN_CP_OUT_KERNEL,
+    CPTritonContext,
+    cp_lse_ag_out_rs,
+    dcp_a2a_lse_reduce,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+logger = init_logger(__name__)
+
+# DCP prefill: gather the DCP ranks' compressed pages of each prefill request
+# and attend the local heads over them (no q gather / LSE combine).
+_DCP_PREFILL_GATHER = os.environ.get("DSV41_DCP_PREFILL_GATHER", "0") == "1"
+# DCP combine: "a2a" (one all-to-all of packed output + LSE) or the default
+# LSE all-gather + head reduce-scatter (--dcp-comm-backend a2a selects a2a too).
+_DCP_COMBINE = os.environ.get("DSV41_DCP_COMBINE", "")
+
+
+def _sm120_sparse_attention_with_lse(
+    query: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    workspace: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor | None,
+    compressed_kv_cache: torch.Tensor | None,
+    extra_indices: torch.Tensor | None,
+    extra_lens: torch.Tensor | None,
+    out: torch.Tensor,
+    sm_scale: float,
+    sinks: torch.Tensor | None,
+    lse: torch.Tensor,
+) -> None:
+    """FlashInfer's SM120 packed sparse-MLA attention, returning the LSE.
+
+    Mirrors the SM120 branch of ``trtllm_batch_decode_sparse_mla_dsv4``
+    (flashinfer 0.7.0.post1, ``flashinfer/mla/_core.py``), whose public entry
+    hard-codes ``return_lse=False``. ``query``/``out`` are ``[T, H, 512]``
+    bf16, ``lse`` is ``[T, H]`` fp32 and receives the BASE-2 LSE of the
+    ``sm_scale``-scaled logits with the sink folded in; a row with no candidate
+    and no sink gets ``-1e30`` and a zero output, which the combine treats as
+    an empty shard.
+    """
+    from flashinfer.mla._core import (
+        _check_sm120_dsv4_kv_cache_layout,
+        _SparseMLASegment,
+        _trtllm_batch_decode_sparse_mla_sm120,
+    )
+
+    num_tokens = query.shape[0]
+    swa_kv_cache = _check_sm120_dsv4_kv_cache_layout(
+        swa_kv_cache, "NHD", "swa_kv_cache"
+    )
+    segments = [
+        _SparseMLASegment(indices=swa_indices.reshape(num_tokens, -1), lengths=swa_lens)
+    ]
+    if extra_indices is not None:
+        assert compressed_kv_cache is not None
+        compressed_kv_cache = _check_sm120_dsv4_kv_cache_layout(
+            compressed_kv_cache, "NHD", "compressed_kv_cache"
+        )
+        segments.append(
+            _SparseMLASegment(
+                indices=extra_indices.reshape(num_tokens, -1),
+                lengths=extra_lens,
+                kv_cache=compressed_kv_cache,
+            )
+        )
+    _trtllm_batch_decode_sparse_mla_sm120(
+        query=query.unsqueeze(1),
+        kv_cache=swa_kv_cache,
+        workspace_buffer=workspace,
+        sparse_mla_segments=segments,
+        out=out.unsqueeze(1),
+        sm_scale=float(sm_scale),
+        sinks=sinks,
+        lse=lse,
+        return_lse=True,
+        kv_scale_format="auto",
+        kv_cache_format="fp8",
+    )
+
 
 _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 # FlashInfer's SM120 DSv4 sparse-MLA kernels are instantiated only for pages of
@@ -616,6 +702,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     swa_backend_cls = DeepseekSparseSWAFlashInferSM120Backend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
     kv_page_states: ClassVar[int | None] = _SM120_PAGE_BLOCK_SIZE
+    # DCP: per-rank partial attention returning the LSE, then a combine.
+    can_return_lse_for_decode: ClassVar[bool] = True
+    # Under DCP the per-token q gather / combine has no cross-token dependency:
+    # bound the transient [T, heads * dcp, 512] buffers inside a prefill chunk.
+    DCP_PREFILL_TOKEN_CHUNK: ClassVar[int] = 2048
+    # DCP prefill gather (DSV41_DCP_PREFILL_GATHER): per step, the gathered
+    # compressed KV per source cache and the remapped top-k per (index source,
+    # ratio, page), shared by every layer of that step.
+    _dcp_gather_cache: ClassVar[dict[str, Any]] = {"step": None}
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
@@ -641,14 +736,68 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
 
         required_topk = _required_sm120_sparse_topk(vllm_config, self.window_size)
-        if not has_flashinfer_sparse_mla_sm120_config(self.padded_heads, required_topk):
+        # DCP: the kernel sees the gathered heads [rank 0 heads | rank 1 heads |
+        # ...]; the local slice must be unpadded so the head reduce-scatter
+        # hands each rank exactly its own heads back.
+        self.n_dcp_heads = self.n_local_heads * self.dcp_world_size
+        if self.dcp_world_size > 1:
+            if self.padded_heads != self.n_local_heads:
+                raise NotImplementedError(
+                    "DeepSeek-V4.1 DCP needs an unpadded local head count in "
+                    f"{_SPARSE_MLA_SUPPORTED_Q_HEADS}; got {self.n_local_heads} "
+                    f"(padded to {self.padded_heads})."
+                )
+            if self.n_dcp_heads not in _SPARSE_MLA_SUPPORTED_Q_HEADS:
+                raise NotImplementedError(
+                    f"DeepSeek-V4.1 DCP gathered head count {self.n_dcp_heads} "
+                    "is not a supported sparse-MLA h_q "
+                    f"{_SPARSE_MLA_SUPPORTED_Q_HEADS}."
+                )
+        kernel_heads = (
+            self.n_dcp_heads if self.dcp_world_size > 1 else self.padded_heads
+        )
+        if not has_flashinfer_sparse_mla_sm120_config(kernel_heads, required_topk):
             raise RuntimeError(
                 "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires a FlashInfer "
                 "DSV4 sparse MLA decode specialization for "
-                f"(num_q_heads={self.padded_heads}, top_k={required_topk}). "
+                f"(num_q_heads={kernel_heads}, top_k={required_topk}). "
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
             )
+        # DCP state: the group (a subset of the TP ranks), the gathered sink
+        # (built on the first forward, after weight loading) and the neutral
+        # SWA index rows of the ranks other than 0.
+        self.dcp_group = get_dcp_group() if self.dcp_world_size > 1 else None
+        self._dcp_sink: torch.Tensor | None = None
+        self._dcp_empty_swa: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # One Triton launch context per layer for the LSE-combine kernel.
+        self._cp_ctx = CPTritonContext() if self.dcp_world_size > 1 else None
+        self._dcp_combine_a2a = (
+            _DCP_COMBINE == "a2a"
+            or vllm_config.parallel_config.dcp_comm_backend == "a2a"
+        )
+        if self.dcp_world_size > 1 and self.compress_ratio > 0:
+            logger.info_once(
+                "DeepSeek-V4.1 SM120 attention under DCP%d: %d local heads -> %d "
+                "gathered, SWA window + sink on DCP rank 0, base-2 LSE %s "
+                "combine, prefill %s",
+                self.dcp_world_size,
+                self.n_local_heads,
+                self.n_dcp_heads,
+                "a2a" if self._dcp_combine_a2a else "ag_rs",
+                "KV gather" if _DCP_PREFILL_GATHER else "q gather + combine",
+            )
+            if (
+                vllm_config.kernel_config.enable_jit_warmup
+                and not self._dcp_combine_a2a
+            ):
+                _CORRECT_ATTN_CP_OUT_KERNEL.register_warmup(
+                    vllm_config,
+                    output_dtype=torch.bfloat16,
+                    num_heads=self.n_dcp_heads,
+                    head_dim=self.head_dim,
+                    is_base_e=False,
+                )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe(
             self._o_proj_block_size
         )
@@ -785,6 +934,227 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             q = padded_query
         return q.contiguous()
 
+    # ---- DCP ---------------------------------------------------------------
+
+    def _compressed_topk_to_slots(
+        self,
+        topk_indices: torch.Tensor,
+        token_to_req_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        block_size: int,
+        is_valid_token: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Indexer top-k (compressed ids) -> physical slots + per-row count.
+
+        DCP1: the request-local ids map through the block table. DCP>1: the ids
+        are GLOBAL compressed ids (the indexer's cross-rank merge); de-interleave
+        them in state coordinates, drop the states other ranks own and compact
+        this rank's slots to a prefix (-1 tail, count). ``block_size`` is the
+        number of states per page on this rank.
+        """
+        if self.dcp_world_size == 1:
+            return compute_global_topk_indices_and_lens(
+                topk_indices,
+                token_to_req_indices,
+                block_table,
+                block_size,
+                is_valid_token,
+            )
+        num_tokens = topk_indices.shape[0]
+        slots, lens = triton_filter_and_convert_dcp_index(
+            token_to_req_indices[:num_tokens].contiguous(),
+            block_table,
+            topk_indices,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            BLOCK_SIZE=block_size,
+            BLOCK_STRIDE_ROWS=block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            BLOCK_N=128,
+            return_valid_counts=True,
+        )
+        # CUDA-graph padding rows attend nothing (parity with the DCP1 kernel).
+        lens.masked_fill_(~is_valid_token[:num_tokens], 0)
+        return slots, lens
+
+    def _dcp_prefill_gather(
+        self,
+        compressed_k_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        token_to_req: torch.Tensor,
+        is_valid_token: torch.Tensor,
+        attn_metadata: DeepseekV4FlashMLAMetadata,
+        num_decodes: int,
+        num_prefills: int,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """DCP prefill without q gather / LSE combine.
+
+        Gathers the DCP ranks' compressed pages of every prefill request into
+        one rank-major paged buffer (request i holds ``W * pages_i`` pages:
+        rank 0's, then rank 1's, ...) and remaps the GLOBAL top-k ids into it.
+        Returns (gathered cache, slots, per-row counts). The gathered KV is
+        shared per source cache and the remap per (index source, ratio, page)
+        across the layers of one step: every layer reads the one top-k buffer
+        its index source wrote, which the next index source overwrites.
+        """
+        cache = type(self)._dcp_gather_cache
+        step = get_forward_context().attn_metadata
+        if cache.get("step") is not step:
+            cache.clear()
+            cache.update(step=step, kv={}, idx={}, geom={})
+        assert self.dcp_group is not None
+        world = self.dcp_world_size
+        interleave = self.cp_kv_cache_interleave_size
+        geom_key = (self.compress_ratio, block_size)
+        geom = cache["geom"].get(geom_key)
+        if geom is None:
+            assert attn_metadata.seq_lens_cpu is not None
+            seq_lens = attn_metadata.seq_lens_cpu[
+                num_decodes : num_decodes + num_prefills
+            ].tolist()
+            # States after this step (state = pos // ratio) in virtual blocks of
+            # block_size * world states = one page per rank; at least one page so
+            # the collective never carries zero bytes.
+            pages = [
+                max(1, -(-(int(sl) // self.compress_ratio) // (block_size * world)))
+                for sl in seq_lens
+            ]
+            base = [0]
+            for p in pages:
+                base.append(base[-1] + world * p)
+            device = topk_indices.device
+            geom = (
+                pages,
+                torch.tensor(pages, device=device, dtype=torch.int64),
+                torch.tensor(base[:-1], device=device, dtype=torch.int64),
+            )
+            cache["geom"][geom_key] = geom
+        pages, pages_t, base_t = geom
+        kv_key = compressed_k_cache.data_ptr()
+        kv = cache["kv"].get(kv_key)
+        if kv is None:
+            pool = self._as_sparse_cache(compressed_k_cache)
+            parts = []
+            for i, p in enumerate(pages):
+                page_ids = attn_metadata.block_table[num_decodes + i, :p].long()
+                local = pool.index_select(0, page_ids).contiguous()
+                parts.append(self.dcp_group.all_gather(local, dim=0))
+            kv = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+            cache["kv"][kv_key] = kv
+        idx_key = (self.index_source_layer_id, *geom_key)
+        idx = cache["idx"].get(idx_key)
+        if idx is None:
+            req = (token_to_req.long() - num_decodes).clamp_(0, max(len(pages) - 1, 0))
+            ids = topk_indices.long()
+            valid = ids >= 0
+            state = ids.clamp_min(0)
+            span = block_size * world
+            vblock = state // span
+            off = state % span
+            owner = (off // interleave) % world
+            local_off = (off // (interleave * world)) * interleave + off % interleave
+            slot = (
+                base_t[req][:, None] + owner * pages_t[req][:, None] + vblock
+            ) * block_size + local_off
+            slots = torch.where(valid, slot, torch.full_like(slot, -1)).to(torch.int32)
+            lens = valid.sum(dim=-1, dtype=torch.int32)
+            lens.masked_fill_(~is_valid_token[: lens.shape[0]], 0)
+            idx = (slots, lens)
+            cache["idx"][idx_key] = idx
+        return kv, idx[0], idx[1]
+
+    def _dcp_attn_sink(self) -> torch.Tensor:
+        """The sink of the gathered heads, in gather order (collective)."""
+        if self._dcp_sink is None:
+            assert self.dcp_group is not None
+            local = self.attn_sink.data[: self.n_local_heads].contiguous()
+            self._dcp_sink = self.dcp_group.all_gather(local, dim=0)
+        return self._dcp_sink
+
+    def _dcp_neutral_swa(
+        self, num_tokens: int, width: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All -1 SWA indices and zero lengths (ranks other than 0)."""
+        buf = self._dcp_empty_swa.get(width)
+        if buf is None or buf[0].shape[0] < num_tokens:
+            rows = max(num_tokens, self.max_num_batched_tokens)
+            buf = (
+                torch.full((rows, 1, width), -1, dtype=torch.int32, device=device),
+                torch.zeros(rows, dtype=torch.int32, device=device),
+            )
+            self._dcp_empty_swa[width] = buf
+        return buf[0][:num_tokens], buf[1][:num_tokens]
+
+    def _run_sm120_dcp(
+        self,
+        q: torch.Tensor,
+        swa_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        extra_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_lens: torch.Tensor | None,
+        output: torch.Tensor,
+    ) -> None:
+        """One DCP attention step for ``q``/``output`` of ``[T, n_local_heads, 512]``.
+
+        Gathers the local heads to ``[T, n_local_heads * W, 512]``, attends this
+        rank's compressed-state shard with the LSE, then combines across the DCP
+        group and scatters the heads back. The replicated SWA window and the
+        sink are attended on DCP rank 0 only, so with ``L_r`` the per-rank
+        base-2 LSEs (sink folded into ``L_0``) the combine ``L = log2(sum_r
+        2^L_r)``, ``o = sum_r 2^(L_r - L) o_r`` reproduces the DCP1 softmax.
+        """
+        assert self.dcp_group is not None
+        num_tokens = q.shape[0]
+        # Collective: every rank builds the gathered sink; only rank 0 applies
+        # it, together with the SWA window.
+        sink = self._dcp_attn_sink()
+        q_gathered = self.dcp_group.all_gather(q, dim=1)
+        num_heads = q_gathered.shape[1]
+        out_gathered = torch.empty(
+            (num_tokens, num_heads, self.head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=q.device)
+        if self.dcp_rank != 0:
+            swa_indices, swa_lens = self._dcp_neutral_swa(
+                num_tokens, swa_indices.shape[-1], q.device
+            )
+        _sm120_sparse_attention_with_lse(
+            q_gathered,
+            swa_cache,
+            self._get_workspace(q.device),
+            swa_indices,
+            swa_lens,
+            extra_cache,
+            extra_indices,
+            extra_lens,
+            out_gathered,
+            self.scale,
+            sink if self.dcp_rank == 0 else None,
+            lse,
+        )
+        # Rows with no local candidate (and no sink) carry the kernel's -1e30
+        # LSE and a zero output, which the max-subtracted exp2 of either combine
+        # turns into zero weight.
+        if self._dcp_combine_a2a:
+            combined = dcp_a2a_lse_reduce(
+                out_gathered, lse, self.dcp_group, is_lse_base_on_e=False
+            )
+        else:
+            combined = cp_lse_ag_out_rs(
+                out_gathered,
+                lse,
+                self.dcp_group,
+                ctx=self._cp_ctx,
+                is_lse_base_on_e=False,
+            )
+        output.copy_(combined)
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -812,10 +1182,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed-layer decode requires top-k indices from the indexer."
                 )
-            # Local indices filled by the index-source layer's indexer.
+            # Indices filled by the index-source layer's indexer (request-local
+            # at DCP1, global compressed ids under DCP).
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             block_size = attn_metadata.block_size // self.compress_ratio
-            global_indices, extra_sparse_lengths = compute_global_topk_indices_and_lens(
+            global_indices, extra_sparse_lengths = self._compressed_topk_to_slots(
                 self.topk_indices_buffer[:num_decode_tokens],
                 swa_metadata.token_to_req_indices,
                 attn_metadata.block_table[:num_decodes],
@@ -835,6 +1206,20 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
+        if self.dcp_world_size > 1 and not swa_only:
+            # SWA-only layers keep the DCP1 path: their cache is replicated and
+            # every rank runs its own heads over the whole window.
+            self._run_sm120_dcp(
+                q,
+                swa_cache,
+                swa_indices,
+                swa_lens,
+                extra_cache,
+                extra_sparse_indices,
+                extra_sparse_lengths,
+                output,
+            )
+            return
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,
@@ -872,6 +1257,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         extra_sparse_indices: torch.Tensor | None = None
         extra_sparse_lengths: torch.Tensor | None = None
+        gathered_kv: torch.Tensor | None = None
         if not swa_only:
             if self.topk_indices_buffer is None:
                 raise RuntimeError(
@@ -895,15 +1281,30 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
             block_size = attn_metadata.block_size // self.compress_ratio
-            extra_sparse_indices, extra_sparse_lengths = (
-                compute_global_topk_indices_and_lens(
-                    local_topk_indices,
-                    swa_metadata.token_to_req_indices[prefill_token_slice],
-                    attn_metadata.block_table,
-                    block_size,
-                    swa_metadata.is_valid_token[prefill_token_slice],
+            if self.dcp_world_size > 1 and _DCP_PREFILL_GATHER:
+                assert compressed_k_cache is not None
+                gathered_kv, extra_sparse_indices, extra_sparse_lengths = (
+                    self._dcp_prefill_gather(
+                        compressed_k_cache,
+                        local_topk_indices,
+                        swa_metadata.token_to_req_indices[prefill_token_slice],
+                        swa_metadata.is_valid_token[prefill_token_slice],
+                        attn_metadata,
+                        num_decodes,
+                        num_prefills,
+                        block_size,
+                    )
                 )
-            )
+            else:
+                extra_sparse_indices, extra_sparse_lengths = (
+                    self._compressed_topk_to_slots(
+                        local_topk_indices,
+                        swa_metadata.token_to_req_indices[prefill_token_slice],
+                        attn_metadata.block_table,
+                        block_size,
+                        swa_metadata.is_valid_token[prefill_token_slice],
+                    )
+                )
 
         assert swa_metadata.prefill_swa_indices is not None
         assert swa_metadata.prefill_swa_lens is not None
@@ -917,7 +1318,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA layers require their compressed KV cache."
                 )
-            extra_kv_paged = self._as_sparse_cache(compressed_k_cache)
+            extra_kv_paged = (
+                gathered_kv
+                if gathered_kv is not None
+                else self._as_sparse_cache(compressed_k_cache)
+            )
 
         num_chunks = (
             num_prefills + self.PREFILL_CHUNK_SIZE - 1
@@ -950,6 +1355,25 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
+            if self.dcp_world_size > 1 and not swa_only and gathered_kv is None:
+                # Chunk bounds come from the host query_start_loc (identical on
+                # every rank), so the collectives line up across ranks.
+                assert extra_sparse_indices is not None
+                assert extra_sparse_lengths is not None
+                qs, qe = int(query_start), int(query_end)
+                for sub_start in range(qs, qe, self.DCP_PREFILL_TOKEN_CHUNK):
+                    sub_end = min(sub_start + self.DCP_PREFILL_TOKEN_CHUNK, qe)
+                    self._run_sm120_dcp(
+                        q[sub_start:sub_end],
+                        swa_kv_paged,
+                        swa_metadata.prefill_swa_indices[sub_start:sub_end],
+                        swa_metadata.prefill_swa_lens[sub_start:sub_end],
+                        extra_kv_paged,
+                        extra_sparse_indices[sub_start:sub_end],
+                        extra_sparse_lengths[sub_start:sub_end],
+                        output[sub_start:sub_end],
+                    )
+                continue
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,

@@ -38,6 +38,10 @@ def check_attention_cp_compatibility(
                     f"but {backend.get_name()} does not support PCP."
                 )
             layer_impl = getattr(layer, "impl", None)
+            if layer_impl is None and hasattr(layer, "need_to_return_lse_for_decode"):
+                # DeepSeek-V4.1 attention runs its own forward (no
+                # AttentionImpl) and exposes the DCP contract on the layer.
+                layer_impl = layer
             if layer_impl is None:
                 continue
             if not check_pcp and layer_impl.dcp_world_size == 1:
