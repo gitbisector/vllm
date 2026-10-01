@@ -11,7 +11,9 @@ import torch.nn as nn
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import DPMetadata, create_forward_context
+from vllm.models.deepseek_v41.common.engram import NgramHashState
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
+from vllm.models.deepseek_v41.nvidia.engram_disk import EngramDiskStager
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -231,6 +233,17 @@ class DeepseekV41ModelState(DefaultModelState):
             )
             self._replay_attn_groups: list[list[AttentionGroup]] | None = None
 
+        # DSV41_ENGRAM_DISK rows are staged in prepare_inputs, outside the
+        # (possibly captured) forward.
+        self.engram_stager: EngramDiskStager | None = None
+        engrams = [m for m in model.modules() if getattr(m, "prestage", False)]
+        if engrams:
+            hash_states = [m for m in model.modules() if isinstance(m, NgramHashState)]
+            assert len(hash_states) == 1, (
+                f"expected one NgramHashState, found {len(hash_states)}"
+            )
+            self.engram_stager = EngramDiskStager(hash_states[0], engrams)
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         self._replay_start_np[req_index] = new_req_data.replay_start
@@ -260,6 +273,19 @@ class DeepseekV41ModelState(DefaultModelState):
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
         model_inputs["lookback_token_ids"] = window
+        if self.engram_stager is not None and input_batch.input_ids is not None:
+            # After this step's ids, positions, query start offsets and the
+            # lookback window above are written; before the forward or replay.
+            positions = model_inputs.get("positions")
+            self.engram_stager.stage(
+                input_batch.input_ids,
+                positions if positions is not None else input_batch.positions,
+                input_batch.query_start_loc[: input_batch.num_reqs + 1],
+                window,
+                input_batch.num_tokens,
+                input_batch=input_batch,
+                req_states=req_states,
+            )
         return model_inputs
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:

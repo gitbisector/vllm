@@ -52,6 +52,7 @@ from ..common.mm_preprocess import (
 )
 from ..common.vl_cudagraph import DeepseekV4VLEncoderCudaGraphMixin
 from ..decoder_replay_layers import DecoderReplayLayers
+from .engram_disk import skip_engram_checkpoint_tensor
 from .model import (
     DeepseekV41LLMForCausalLM,
     _linear_scale_param_name,
@@ -136,6 +137,10 @@ class DeepseekV41ForCausalLM(
     # (all carrying image_token_id, see common/mm_preprocess.py) and apply
     # bias_vl.
     requires_raw_input_tokens = True
+
+    # DSV41_ENGRAM_DISK=1 serves the Engram tables from disk (engram_disk.py);
+    # the loader then never reads them.
+    skip_checkpoint_tensor = staticmethod(skip_engram_checkpoint_tensor)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
