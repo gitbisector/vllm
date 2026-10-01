@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm.triton_utils import tl, triton
+
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+# Scratch cap for the DCP block-score all-reduce (bytes per row slice).
+_DCP_REDUCE_BYTES = 128 * 1024 * 1024
 
 
 @triton.jit
@@ -27,6 +35,7 @@ def _block_scores_kernel(
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
     TILE: tl.constexpr,
+    PIN_NEWEST: tl.constexpr = True,
 ):
     row = tl.program_id(0).to(tl.int64)
     blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
@@ -43,11 +52,12 @@ def _block_scores_kernel(
         other=-float("inf"),
     )
     reduced = tl.reduce(values, 1, _max_with_nan)
-    reduced = tl.where(
-        (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE),
-        float("inf"),
-        reduced,
-    )
+    if PIN_NEWEST:
+        reduced = tl.where(
+            (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE),
+            float("inf"),
+            reduced,
+        )
     tl.store(scores + row * nblocks + blocks, reduced, blocks < nblocks)
 
 
@@ -138,27 +148,15 @@ def _mask_candidates_kernel(
     )
 
 
-def select_candidate_blocks(
+def _block_scores(
     logits: torch.Tensor,
     row_ks: torch.Tensor | None,
     row_ke: torch.Tensor,
-    topk_blocks: int,
     block_size: int,
-    out: torch.Tensor,
-    row_repeat: int = 1,
-) -> None:
-    """Select local block IDs by maximum score, pinning each row's newest block.
-
-    Row bounds are in packed column space; absent starts mean zero.
-    Decode rows share bounds in groups of ``row_repeat``. Output is -1 padded.
-    """
-    assert logits.is_cuda
+    row_repeat: int,
+    pin_newest: bool,
+) -> torch.Tensor:
     rows, width = logits.shape
-    if not rows:
-        return
-    if not width:
-        out.fill_(-1)
-        return
     nblocks = triton.cdiv(width, block_size)
     scores = logits.new_empty((rows, nblocks))
     _block_scores_kernel[(rows, triton.cdiv(nblocks, 128))](
@@ -175,7 +173,65 @@ def select_candidate_blocks(
         row_ks is not None,
         row_repeat,
         128,
+        PIN_NEWEST=pin_newest,
     )
+    return scores
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    row_ks: torch.Tensor | None,
+    row_ke: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+    out: torch.Tensor,
+    row_repeat: int = 1,
+    *,
+    dcp_group: "GroupCoordinator | None" = None,
+    global_row_ke: torch.Tensor | None = None,
+    global_block_size: int | None = None,
+    max_global_blocks: int | None = None,
+) -> None:
+    """Select local block IDs by maximum score, pinning each row's newest block.
+
+    Row bounds are in packed column space; absent starts mean zero.
+    Decode rows share bounds in groups of ``row_repeat``. Output is -1 padded.
+
+    Under DCP (``dcp_group`` given) ``logits`` hold this rank's local packed
+    columns and ``block_size`` is the LOCAL block, ``global_block_size //
+    world``: with interleave 1, local block ``b`` is exactly this rank's states
+    of global block ``b``, so the global block score is the MAX over ranks of
+    the local block scores (one all-reduce over ``[rows, max_global_blocks]``)
+    and the block ids need no translation. The newest block is pinned from the
+    GLOBAL per-row context ``global_row_ke`` (states, per row or per
+    ``row_repeat`` group) after the reduce, so every rank pins the same block.
+    Collective: every DCP rank must call this with the same ``rows`` and
+    ``max_global_blocks`` (an empty local shard is fine).
+    """
+    assert logits.is_cuda
+    rows, width = logits.shape
+    if not rows:
+        return
+    if dcp_group is not None:
+        _select_candidate_blocks_dcp(
+            logits,
+            row_ks,
+            row_ke,
+            topk_blocks,
+            block_size,
+            out,
+            row_repeat,
+            dcp_group,
+            global_row_ke,
+            global_block_size,
+            max_global_blocks,
+        )
+        return
+    if not width:
+        out.fill_(-1)
+        return
+    scores = _block_scores(logits, row_ks, row_ke, block_size, row_repeat, True)
+    nblocks = scores.shape[1]
     # Keep the existing top-k tie behavior.
     top = scores.topk(min(topk_blocks, nblocks), dim=-1)
     _store_candidates_kernel[(rows, triton.cdiv(topk_blocks, 256))](
@@ -189,6 +245,71 @@ def select_candidate_blocks(
     )
 
 
+def _select_candidate_blocks_dcp(
+    logits: torch.Tensor,
+    row_ks: torch.Tensor | None,
+    row_ke: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+    out: torch.Tensor,
+    row_repeat: int,
+    dcp_group: "GroupCoordinator",
+    global_row_ke: torch.Tensor | None,
+    global_block_size: int | None,
+    max_global_blocks: int | None,
+) -> None:
+    assert global_row_ke is not None
+    assert global_block_size is not None and max_global_blocks is not None
+    assert global_block_size == block_size * dcp_group.world_size, (
+        "DCP candidate blocks need block_size == global_block_size // world"
+    )
+    rows, width = logits.shape
+    nblocks = max(int(max_global_blocks), 1)
+    ends = global_row_ke.reshape(-1)
+    if row_repeat > 1:
+        ends = ends.repeat_interleave(row_repeat)
+    ends = ends[:rows].to(torch.int64)
+    # Pin each row's newest GLOBAL block, as DCP1 pins (end - start - 1) //
+    # block from the global bounds; rows without context select nothing.
+    pin = ((ends - 1) // global_block_size).clamp_(0, nblocks - 1).view(-1, 1)
+    local = (
+        _block_scores(logits, row_ks, row_ke, block_size, row_repeat, False)
+        if width
+        else None
+    )
+    # Reduce in row slices: a 16K-token prefill chunk at 128K context would
+    # otherwise need a ~1 GiB scratch per rank. The slice count derives from
+    # rows and nblocks, identical on every rank, so the collectives line up.
+    k = min(topk_blocks, nblocks)
+    rows_per_slice = max(1, _DCP_REDUCE_BYTES // (nblocks * 4))
+    top_values = logits.new_empty((rows, k))
+    top_indices = torch.empty((rows, k), dtype=torch.int64, device=logits.device)
+    for r0 in range(0, rows, rows_per_slice):
+        r1 = min(r0 + rows_per_slice, rows)
+        scores = logits.new_full((r1 - r0, nblocks), -float("inf"))
+        if local is not None:
+            n = min(local.shape[1], nblocks)
+            scores[:, :n] = local[r0:r1, :n]
+        torch.distributed.all_reduce(
+            scores, op=torch.distributed.ReduceOp.MAX, group=dcp_group.device_group
+        )
+        scores.scatter_(1, pin[r0:r1], float("inf"))
+        scores.masked_fill_((ends[r0:r1] <= 0).view(-1, 1), -float("inf"))
+        # Keep the existing top-k tie behavior.
+        top = scores.topk(k, dim=-1)
+        top_values[r0:r1] = top.values
+        top_indices[r0:r1] = top.indices
+    _store_candidates_kernel[(rows, triton.cdiv(topk_blocks, 256))](
+        top_values,
+        top_indices,
+        out,
+        *out.stride(),
+        k,
+        topk_blocks,
+        256,
+    )
+
+
 def apply_candidate_mask(
     logits: torch.Tensor,
     row_ks: torch.Tensor | None,
@@ -197,7 +318,12 @@ def apply_candidate_mask(
     block_size: int,
     row_repeat: int = 1,
 ) -> None:
-    """Mask packed logits outside causal bounds and request-local candidates."""
+    """Mask packed logits outside causal bounds and request-local candidates.
+
+    Under DCP pass the LOCAL block size (global // world): local block ``b``
+    is this rank's shard of global block ``b``, so the candidate ids apply
+    unchanged.
+    """
     assert logits.is_cuda
     rows, width = logits.shape
     if not rows or not width:

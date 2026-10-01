@@ -205,6 +205,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_config = vllm_config.cache_config
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            # The indexer handles DCP for DeepSeek-V4.1's sharded compressed
+            # caches; this layer has no per-rank combine.
+            raise NotImplementedError(
+                "DeepSeek-V4 sparse attention does not support decode context "
+                "parallelism."
+            )
 
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size

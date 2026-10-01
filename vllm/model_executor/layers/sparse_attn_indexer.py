@@ -133,6 +133,38 @@ def _merge_dcp_topk_global(
     )
 
 
+def _dcp_decode_global_row_ends(
+    global_seq_lens: torch.Tensor | None,
+    batch_size: int,
+    next_n: int,
+    num_rows: int,
+    row_repeat: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Global (un-sharded) context in compressed states for each decode logits
+    row, or each ``row_repeat`` group of rows: the DCP candidate pin."""
+    assert global_seq_lens is not None
+    lens = global_seq_lens.reshape(-1)
+    if row_repeat > 1:
+        lens = lens[:batch_size]
+    elif lens.numel() == num_rows:
+        pass
+    elif lens.numel() == batch_size and next_n > 1:
+        # Native spec decode: per-request lengths -> per-row causal lengths.
+        lens = (
+            lens.unsqueeze(1)
+            - next_n
+            + 1
+            + torch.arange(next_n, device=lens.device, dtype=lens.dtype)
+        ).clamp_(min=0)
+        lens = lens.reshape(-1)
+    num_ends = num_rows // row_repeat
+    if lens.numel() < num_ends:
+        # Graph-padding rows have no context and select nothing.
+        lens = torch.cat([lens, lens.new_zeros(num_ends - lens.numel())])
+    return lens[:num_ends] // compress_ratio
+
+
 def dcp_gather_kv_rows(
     local_padded: torch.Tensor,
     deinterleave_idx: torch.Tensor,
@@ -345,6 +377,7 @@ def sparse_attn_indexer(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
     topk_backend: str = "auto",
+    compress_ratio: int = 1,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -352,13 +385,25 @@ def sparse_attn_indexer(
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
+    # v4.1 two-level candidate filtering under DCP: the logits columns are this
+    # rank's local compressed states; with interleave 1 and world | block, local
+    # block b (size block // world) is exactly this rank's shard of global block
+    # b, so candidate ids need no translation. The source MAX-reduces block
+    # scores across ranks and pins the global newest block (candidate_blocks.py).
+    local_candidate_block_size = candidate_block_size
+    candidate_dcp_group = None
     if candidate_blocks is not None:
-        # Candidate blocks are request-local; the DCP-sharded logits layout
-        # would need per-rank translation that is not implemented.
-        assert dcp_world_size == 1, (
-            "v4.1 two-level candidate filtering is not supported with DCP."
-        )
         assert candidate_block_size > 0
+        if dcp_world_size > 1:
+            assert cp_kv_cache_interleave_size == 1, (
+                "v4.1 candidate filtering under DCP needs cp_kv_cache_interleave_size=1"
+            )
+            assert candidate_block_size % dcp_world_size == 0, (
+                f"candidate_block_size ({candidate_block_size}) must be a "
+                f"multiple of dcp_world_size ({dcp_world_size})"
+            )
+            local_candidate_block_size = candidate_block_size // dcp_world_size
+            candidate_dcp_group = get_dcp_group()
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
@@ -557,6 +602,24 @@ def sparse_attn_indexer(
             if chunk.local_total_seq_lens == 0 or q_slice.shape[0] == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
+                if candidate_write and candidate_dcp_group is not None:
+                    # Other ranks may hold states of this chunk: join their MAX
+                    # reduce with an empty local contribution.
+                    assert candidate_blocks is not None
+                    _select_candidate_blocks(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        candidate_blocks.shape[1],
+                        local_candidate_block_size,
+                        candidate_blocks[chunk.token_start : chunk.token_end],
+                        dcp_group=candidate_dcp_group,
+                        global_row_ke=chunk.global_ctx_lens,
+                        global_block_size=candidate_block_size,
+                        max_global_blocks=triton.cdiv(
+                            chunk.max_global_ctx, candidate_block_size
+                        ),
+                    )
             else:
                 # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
                 # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.
@@ -602,8 +665,14 @@ def sparse_attn_indexer(
                             cu_seqlen_ks,
                             cu_seqlen_ke,
                             chunk_candidates.shape[1],
-                            candidate_block_size,
+                            local_candidate_block_size,
                             chunk_candidates,
+                            dcp_group=candidate_dcp_group,
+                            global_row_ke=chunk.global_ctx_lens,
+                            global_block_size=candidate_block_size,
+                            max_global_blocks=triton.cdiv(
+                                chunk.max_global_ctx, candidate_block_size
+                            ),
                         )
                     else:
                         _apply_candidate_mask(
@@ -611,7 +680,7 @@ def sparse_attn_indexer(
                             cu_seqlen_ks,
                             cu_seqlen_ke,
                             chunk_candidates,
-                            candidate_block_size,
+                            local_candidate_block_size,
                         )
                 ops.top_k_per_row_prefill(
                     logits,
@@ -745,14 +814,33 @@ def sparse_attn_indexer(
             vis = vis[:num_rows]
             decode_candidates = candidate_blocks[:num_rows]
             if candidate_write:
+                global_row_ke = None
+                max_global_blocks = 0
+                if candidate_dcp_group is not None:
+                    global_row_ke = _dcp_decode_global_row_ends(
+                        decode_metadata.global_seq_lens,
+                        batch_size,
+                        next_n,
+                        num_rows,
+                        row_repeat,
+                        compress_ratio,
+                    )
+                    max_global_blocks = triton.cdiv(
+                        attn_metadata_narrowed.max_seq_len // compress_ratio,
+                        candidate_block_size,
+                    )
                 _select_candidate_blocks(
                     logits,
                     None,
                     vis,
                     decode_candidates.shape[1],
-                    candidate_block_size,
+                    local_candidate_block_size,
                     decode_candidates,
                     row_repeat,
+                    dcp_group=candidate_dcp_group,
+                    global_row_ke=global_row_ke,
+                    global_block_size=candidate_block_size,
+                    max_global_blocks=max_global_blocks,
                 )
             else:
                 _apply_candidate_mask(
@@ -760,7 +848,7 @@ def sparse_attn_indexer(
                     None,
                     vis,
                     decode_candidates,
-                    candidate_block_size,
+                    local_candidate_block_size,
                     row_repeat,
                 )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
@@ -827,6 +915,7 @@ def sparse_attn_indexer_fake(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
     topk_backend: str = "auto",
+    compress_ratio: int = 1,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -1004,6 +1093,7 @@ class SparseAttnIndexer(CustomOp):
             candidate_block_size=self.candidate_block_size,
             candidate_write=self.candidate_write,
             topk_backend=self.topk_backend,
+            compress_ratio=self.compress_ratio,
         )
 
     def forward_xpu(
