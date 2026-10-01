@@ -63,6 +63,22 @@ _DCP_PREFILL_GATHER = os.environ.get("DSV41_DCP_PREFILL_GATHER", "0") == "1"
 _DCP_COMBINE = os.environ.get("DSV41_DCP_COMBINE", "")
 
 
+def _zero_null_kv_block(*caches: torch.Tensor | None) -> None:
+    """Keep the null block (block 0) of each SM120 KV cache zero.
+
+    FlashInfer's SM120 sparse-MLA kernel clamps masked and invalid slot indices
+    to row 0 (prefill_common.cuh: ``idx = (idx >= 0) ? idx : 0``) and still
+    gathers V there: the score is masked to zero, but 0 * NaN = NaN. Block 0 is
+    the null block of every KV group, so nothing valid lives in it, yet layers
+    of other groups sharing the buffer can leave non-fp8 bytes there; any such
+    byte then poisons every masked slot of a real request. A per-call memset of
+    one page is cheap and graph-capturable.
+    """
+    for cache in caches:
+        if cache is not None:
+            cache[0].zero_()
+
+
 def _sm120_sparse_attention_with_lse(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -1141,6 +1157,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_indices, swa_lens = self._dcp_neutral_swa(
                 num_tokens, swa_indices.shape[-1], q.device
             )
+        _zero_null_kv_block(swa_cache, extra_cache)
         _sm120_sparse_attention_with_lse(
             q_gathered,
             swa_cache,
@@ -1237,6 +1254,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 output,
             )
             return
+        _zero_null_kv_block(swa_cache, extra_cache)
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,
@@ -1391,6 +1409,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         output[sub_start:sub_end],
                     )
                 continue
+            _zero_null_kv_block(swa_kv_paged, extra_kv_paged)
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,
