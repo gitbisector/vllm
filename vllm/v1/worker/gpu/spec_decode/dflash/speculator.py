@@ -39,14 +39,20 @@ class DFlashSpeculator(DraftModelSpeculator):
         parallel_config = vllm_config.parallel_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
+        draft_model_config = speculative_config.draft_model_config
+        # A DeepSeek-V4(.1) draft is sliding-window only: its caches are
+        # DCP-replicated and its attention never needs the DCP combine, so the
+        # whole draft runs at DCP1 under a DCP target.
+        draft_shards_kv = draft_model_config.use_mla and (
+            draft_model_config.hf_config.model_type
+            not in ("deepseek_v4", "deepseek_v41")
+        )
         vllm_config = copy.copy(vllm_config)
         vllm_config.parallel_config = replace(
             parallel_config,
             prefill_context_parallel_size=1,
             decode_context_parallel_size=(
-                parallel_config.decode_context_parallel_size
-                if speculative_config.draft_model_config.use_mla
-                else 1
+                parallel_config.decode_context_parallel_size if draft_shards_kv else 1
             ),
         )
         super().__init__(vllm_config, device)
