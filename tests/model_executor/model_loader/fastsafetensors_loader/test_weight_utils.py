@@ -152,3 +152,49 @@ def test_fastsafetensors_needs_plan(budget, largest_span, group_size, resident, 
         )
         is plan
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="fastsafetensors requires NVIDIA/AMD GPUs",
+)
+def test_skip_tensor_is_never_yielded_or_planned(monkeypatch):
+    """Tensors the model never loads are skipped by both iterators.
+
+    Skipping wte.weight (147 MiB) also takes it out of the memory plan: GPT-2's
+    next largest tensor is under 10 MiB, so a 64 MiB budget plans the shard. If
+    the planner still counted wte, the shard would go to the lazy fallback,
+    which this test forbids.
+    """
+    from vllm.model_executor.model_loader import weight_utils
+
+    def skip(name: str) -> bool:
+        return name == "wte.weight" or name.startswith("h.0.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        safetensors = _download_gpt2(tmpdir)
+        reference = {
+            name: tensor
+            for name, tensor in safetensors_weights_iterator(safetensors, True)
+            if not skip(name)
+        }
+        lazy = dict(safetensors_weights_iterator(safetensors, True, skip_tensor=skip))
+        assert lazy.keys() == reference.keys()
+
+        monkeypatch.setenv(
+            "VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET", str(64 * 1024 * 1024)
+        )
+
+        def no_lazy(*args, **kwargs):
+            raise AssertionError("skipped tensor still sized the plan")
+
+        monkeypatch.setattr(weight_utils, "safetensors_weights_iterator", no_lazy)
+        fast = {
+            name: tensor.to("cpu")
+            for name, tensor in fastsafetensors_weights_iterator(
+                safetensors, True, skip_tensor=skip
+            )
+        }
+    assert fast.keys() == reference.keys()
+    for name, tensor in fast.items():
+        assert torch.equal(tensor, reference[name])
