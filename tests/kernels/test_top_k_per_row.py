@@ -1897,8 +1897,12 @@ def test_sparse_indexer_topk_backend_resolution() -> None:
             resolve("auto", unaligned_logits, num_rows=AUTO_COOPERATIVE_MAX_ROWS)
             == "cooperative"
         )
-    # ...and persistent past the row limit.
-    assert resolve("auto", unaligned_logits, num_rows=128) == "persistent"
+    # ...and persistent past the row limit (per_row on SM12x, where
+    # persistent_topk is slower and can fail to launch on wide rows).
+    past_limit = (
+        "per_row" if current_platform.is_device_capability_family(120) else "persistent"
+    )
+    assert resolve("auto", unaligned_logits, num_rows=128) == past_limit
     # Unsupported topk (outside {512, 1024, 2048} for the workspace kernels)
     # -> per_row fallback.
     assert resolve("auto", k=5000) == "per_row"
