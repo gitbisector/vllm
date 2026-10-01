@@ -707,9 +707,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     # Under DCP the per-token q gather / combine has no cross-token dependency:
     # bound the transient [T, heads * dcp, 512] buffers inside a prefill chunk.
     DCP_PREFILL_TOKEN_CHUNK: ClassVar[int] = 2048
-    # DCP prefill gather (DSV41_DCP_PREFILL_GATHER): per step, the gathered
-    # compressed KV per source cache and the remapped top-k per (index source,
-    # ratio, page), shared by every layer of that step.
+    # DCP prefill gather (DSV41_DCP_PREFILL_GATHER), within one step: the
+    # gathered compressed KV of the current source cache and the remapped top-k
+    # of the current (index source, ratio, page), shared by the layers that use
+    # them. Sources only advance with depth, so a superseded entry is never
+    # reused and is dropped; the last compressed layer releases the rest.
     _dcp_gather_cache: ClassVar[dict[str, Any]] = {"step": None}
 
     @staticmethod
@@ -753,21 +755,29 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     "is not a supported sparse-MLA h_q "
                     f"{_SPARSE_MLA_SUPPORTED_Q_HEADS}."
                 )
-        kernel_heads = (
-            self.n_dcp_heads if self.dcp_world_size > 1 else self.padded_heads
-        )
-        if not has_flashinfer_sparse_mla_sm120_config(kernel_heads, required_topk):
-            raise RuntimeError(
-                "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires a FlashInfer "
-                "DSV4 sparse MLA decode specialization for "
-                f"(num_q_heads={kernel_heads}, top_k={required_topk}). "
-                "Install a FlashInfer build containing "
-                "flashinfer-ai/flashinfer#4380."
-            )
+        # The local heads run SWA-only layers and the DCP prefill gather; the
+        # gathered heads run the DCP combine path.
+        for kernel_heads in dict.fromkeys((self.padded_heads, self.n_dcp_heads)):
+            if not has_flashinfer_sparse_mla_sm120_config(kernel_heads, required_topk):
+                raise RuntimeError(
+                    "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires a FlashInfer "
+                    "DSV4 sparse MLA decode specialization for "
+                    f"(num_q_heads={kernel_heads}, top_k={required_topk}). "
+                    "Install a FlashInfer build containing "
+                    "flashinfer-ai/flashinfer#4380."
+                )
         # DCP state: the group (a subset of the TP ranks), the gathered sink
         # (built on the first forward, after weight loading) and the neutral
         # SWA index rows of the ranks other than 0.
         self.dcp_group = get_dcp_group() if self.dcp_world_size > 1 else None
+        # The last backbone layer with a compressed cache: after its prefill no
+        # layer of the step reads the gathered KV again.
+        config = vllm_config.model_config.hf_config
+        ratios = list(getattr(config, "compress_ratios", None) or ())
+        self._is_last_compressed_layer = self.layer_id == max(
+            (i for i, r in enumerate(ratios[: config.num_hidden_layers]) if r > 0),
+            default=-1,
+        )
         self._dcp_sink: torch.Tensor | None = None
         self._dcp_empty_swa: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # One Triton launch context per layer for the LSE-combine kernel.
@@ -850,6 +860,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
             )
+            if self._is_last_compressed_layer:
+                # Release the DCP prefill gather before the step ends, so it
+                # never outlives the step into decode-only steps.
+                type(self)._dcp_gather_cache.clear()
         if swa_metadata.num_decodes > 0:
             self._forward_decode(
                 q=q[:num_decode_tokens],
@@ -1035,6 +1049,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         kv_key = compressed_k_cache.data_ptr()
         kv = cache["kv"].get(kv_key)
         if kv is None:
+            # Free the previous source's gather before allocating this one.
+            cache["kv"].clear()
             pool = self._as_sparse_cache(compressed_k_cache)
             parts = []
             for i, p in enumerate(pages):
@@ -1046,6 +1062,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         idx_key = (self.index_source_layer_id, *geom_key)
         idx = cache["idx"].get(idx_key)
         if idx is None:
+            cache["idx"].clear()
             req = (token_to_req.long() - num_decodes).clamp_(0, max(len(pages) - 1, 0))
             ids = topk_indices.long()
             valid = ids >= 0

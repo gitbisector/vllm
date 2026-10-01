@@ -149,7 +149,7 @@ def test_prefill_gather_remaps_global_ids(monkeypatch):
     def all_gather(local, dim=0):
         # Emulate the other rank's contribution with its own pool.
         i = next(calls)
-        page_ids = gathered[i]
+        page_ids = gathered[i % num_prefills]
         return torch.cat([pool.index_select(0, page_ids) for pool in pools], dim)
 
     layer = object.__new__(fs.DeepseekV4FlashInferSM120Attention)
@@ -167,7 +167,10 @@ def test_prefill_gather_remaps_global_ids(monkeypatch):
     monkeypatch.setattr(
         fs, "get_forward_context", lambda: SimpleNamespace(attn_metadata=step)
     )
-    monkeypatch.setattr(fs.DeepseekV4FlashInferSM120Attention, "_dcp_gather_cache", {})
+    cache: dict = {}
+    monkeypatch.setattr(
+        fs.DeepseekV4FlashInferSM120Attention, "_dcp_gather_cache", cache
+    )
     monkeypatch.setattr(
         fs.DeepseekV4FlashInferSM120Attention,
         "_as_sparse_cache",
@@ -195,3 +198,15 @@ def test_prefill_gather_remaps_global_ids(monkeypatch):
                 assert slots[row, col] == -1
                 continue
             assert flat[slots[row, col]].tolist() == [req, state]
+
+    # A later source / index source supersedes the earlier entries: only the
+    # current gather and remap stay alive within the step.
+    first_kv = kv
+    layer.__dict__["index_source_layer_id"] = 1
+    other_source = pools[1]
+    kv2, _, _ = layer._dcp_prefill_gather(
+        other_source, topk, token_to_req, valid, metadata, num_decodes, num_prefills, 4
+    )
+    assert kv2 is not first_kv
+    assert list(cache["kv"]) == [other_source.data_ptr()]
+    assert list(cache["idx"]) == [(1, ratio, 4)]

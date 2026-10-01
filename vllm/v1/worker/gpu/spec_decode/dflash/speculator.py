@@ -32,6 +32,24 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _is_dsv4_draft(draft_model_config) -> bool:
+    """Whether the draft is a DeepSeek-V4(.1) DSpark draft, judged by the
+    rewrite SpeculativeConfig applies (model_type deepseek_v4/deepseek_v41,
+    DSpark(V41)DraftModel architecture) on the config or its text config."""
+    configs = (
+        getattr(draft_model_config, "hf_config", None),
+        getattr(draft_model_config, "hf_text_config", None),
+    )
+    return any(
+        getattr(c, "model_type", None) in ("deepseek_v4", "deepseek_v41")
+        or bool(
+            {"DSparkDraftModel", "DSparkV41DraftModel"}
+            & set(getattr(c, "architectures", None) or ())
+        )
+        for c in configs
+    )
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -43,10 +61,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # A DeepSeek-V4(.1) draft is sliding-window only: its caches are
         # DCP-replicated and its attention never needs the DCP combine, so the
         # whole draft runs at DCP1 under a DCP target.
-        draft_text_config = getattr(draft_model_config, "hf_text_config", None)
-        draft_shards_kv = draft_model_config.use_mla and (
-            getattr(draft_text_config, "model_type", None)
-            not in ("deepseek_v4", "deepseek_v41")
+        draft_shards_kv = draft_model_config.use_mla and not _is_dsv4_draft(
+            draft_model_config
         )
         vllm_config = copy.copy(vllm_config)
         vllm_config.parallel_config = replace(
