@@ -101,8 +101,8 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        # Any multiple of 32; the sparse decode kernels take the page size at
-        # runtime.
+        # A multiple of 32; most sparse decode kernels take the page size at
+        # runtime, FlashInfer's SM120 ones only 64 (kv_page_states).
         self.block_size = block_size
         # uint8: fp8_ds_mla UE8M0 paged layout. bfloat16 / float8_e4m3fn:
         # contiguous full-cache layout.
