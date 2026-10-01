@@ -25,6 +25,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
     DeepseekV41SparseSWAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import (
@@ -41,6 +42,9 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+# FlashInfer's SM120 DSv4 sparse-MLA kernels are instantiated only for pages of
+# 64 rows (_DECODE_DSV4_PAGE_BLOCK_SIZE); a page of any other size has no kernel.
+_SM120_PAGE_BLOCK_SIZE = 64
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 
 
@@ -115,6 +119,15 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        if current_platform.is_cuda() and current_platform.is_device_capability_family(
+            120
+        ):
+            # SM120 pages hold 64 compressed states: 64 tokens at ratio 1, 128
+            # at ratio 2. Without a spec, accept the page of either ratio.
+            tokens_per_state = getattr(kv_cache_spec, "tokens_per_state", None)
+            if isinstance(tokens_per_state, int):
+                return [_SM120_PAGE_BLOCK_SIZE * tokens_per_state]
+            return [128, _SM120_PAGE_BLOCK_SIZE]
         return [128]
 
     @staticmethod
@@ -229,6 +242,15 @@ class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAFlashInferMetadataBuilder]:
         return DeepseekSparseSWAFlashInferMetadataBuilder
+
+
+class DeepseekSparseSWAFlashInferSM120Backend(DeepseekSparseSWAFlashInferBackend):
+    """SWA cache on SM12x: FlashInfer's SM120 kernels take only 64-token pages,
+    so the page must not be any other multiple of 32."""
+
+    @staticmethod
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        return [_SM120_PAGE_BLOCK_SIZE]
 
 
 class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
@@ -591,8 +613,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
 
     backend_cls = DeepseekV4FlashInferMLASparseBackend
-    swa_backend_cls = DeepseekSparseSWAFlashInferBackend
+    swa_backend_cls = DeepseekSparseSWAFlashInferSM120Backend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    kv_page_states: ClassVar[int | None] = _SM120_PAGE_BLOCK_SIZE
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:

@@ -198,6 +198,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
     PREFILL_CHUNK_SIZE: ClassVar[int] = 4
+    # Set when the kernels are instantiated for one page size: SWA pages are
+    # then this many tokens, compressed-KV and indexer pages this many states
+    # (times compress_ratio tokens). None: 32-token SWA pages (the sparse decode
+    # kernels take the page size at runtime) and cache_config.block_size.
+    kv_page_states: ClassVar[int | None] = None
 
     # ---- attention-interface contract, declared by the platform subclass ----
 
@@ -443,6 +448,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     prefix=f"{prefix}.indexer.k_cache",
                     cache_config=cache_config,
                     compress_ratio=self.compress_ratio,
+                    block_size=self._compressed_page_tokens(),
                 )
             else:
                 assert self.kv_source_layer_id is not None
@@ -561,7 +567,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            block_size=self.kv_page_states or 32,
             packed_bytes_per_token=self.swa_bytes_per_token,
             packed_page_alignment=self.kv_page_alignment,
             bounded_replay=swa_bounded_replay,
@@ -1107,6 +1113,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
+    def _compressed_page_tokens(self) -> int | None:
+        """Tokens per compressed-KV / indexer page when the kernels fix the
+        page's state count; None uses cache_config.block_size."""
+        if self.kv_page_states is None or self.compress_ratio == 0:
+            return None
+        return self.kv_page_states * self.compress_ratio
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Only kv-source layers own a compressed-KV cache; consumers read the
         # source's cache through the forward context, and cr==0 layers are
@@ -1119,7 +1132,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # use natural element-size pages.
         uses_fp8_ds_mla_layout = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=(
+                self._compressed_page_tokens() or vllm_config.cache_config.block_size
+            ),
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
@@ -1152,6 +1167,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         prefix: str,
         cache_config: CacheConfig,
         compress_ratio: int = 1,
+        block_size: int | None = None,
     ):
         super().__init__()
         self.kv_cache = torch.tensor([])
@@ -1160,6 +1176,9 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.cache_config = cache_config
         self.dtype = dtype
         self.compress_ratio = compress_ratio
+        # Set by kernels that fix the states per page (SM12x: 64, also what
+        # DeepGEMM's paged MQA logits take there); None: cache_config.block_size.
+        self.block_size = block_size
         vllm_config = get_current_vllm_config()
         self.sparse_logits = vllm_config.attention_config.indexer_sparse_logits
         # aiter's paged MXFP4 kernels write this cache and read it in place.
@@ -1189,7 +1208,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
         )
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=self.block_size or self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
