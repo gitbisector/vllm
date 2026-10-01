@@ -347,6 +347,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 f"{self.compress_ratio}; only 0 (sliding window), 1 and 2 are "
                 "supported."
             )
+        if (
+            layer_id >= config.num_hidden_layers
+            and self.compress_ratio > 0
+            and get_dcp_world_size_and_rank()[0] > 1
+        ):
+            # A DSpark draft runs at DCP1 on the premise that its layers are
+            # sliding-window only; a compressed draft layer would read a
+            # target source's DCP-sharded cache with DCP1 kernels.
+            raise NotImplementedError(
+                f"DeepSeek-V4.1 draft layer {layer_id} has compress_ratio="
+                f"{self.compress_ratio}; under decode context parallelism the "
+                "DSpark draft must be sliding-window only."
+            )
         self.kv_source_layers = tuple(
             getattr(config, "kv_source_layer_ids", None) or ()
         )
