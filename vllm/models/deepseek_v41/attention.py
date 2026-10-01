@@ -48,7 +48,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_dcp_world_size_and_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -204,6 +204,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # (times compress_ratio tokens). None: 32-token SWA pages (the sparse decode
     # kernels take the page size at runtime) and cache_config.block_size.
     kv_page_states: ClassVar[int | None] = None
+    # DCP contract, mirroring AttentionImpl: the layer runs its own forward (no
+    # AttentionImpl), so check_attention_cp_compatibility reads these from the
+    # layer. A platform subclass that attends this rank's compressed-state shard
+    # and combines the partial results by LSE sets can_return_lse_for_decode.
+    can_return_lse_for_decode: ClassVar[bool] = False
+    supports_mtp_with_cp_non_trivial_interleave_size: ClassVar[bool] = False
 
     # ---- attention-interface contract, declared by the platform subclass ----
 
@@ -298,6 +304,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_heads = config.num_attention_heads
         assert self.n_heads % tp_size == 0
         self.n_local_heads = self.n_heads // tp_size
+        # Decode context parallelism: the compressed and indexer caches are
+        # sharded over compressed states across the DCP group, the SWA cache
+        # and compressor ring are replicated; the platform subclass gathers
+        # queries and combines the per-rank partial attention.
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.need_to_return_lse_for_decode = (
+            self.dcp_world_size > 1 and self.can_return_lse_for_decode
+        )
+        if self.dcp_world_size > 1 and self.cp_kv_cache_interleave_size != 1:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 DCP supports cp_kv_cache_interleave_size=1 only "
+                f"(got {self.cp_kv_cache_interleave_size})."
+            )
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
