@@ -123,6 +123,25 @@ def _is_mtp_tensor(name: str) -> bool:
     return name.startswith("mtp.")
 
 
+def _release_load_pools() -> None:
+    """Return the loader's cached device and pinned-host blocks to the driver.
+
+    KV allocation, warm-up and CUDA-graph capture follow the load and are the
+    tightest point of the boot. On unified memory (GB10) blocks the caching
+    allocators keep are host RAM those phases cannot use: the staging buffers
+    are dead by now, but held they cost graph capture ~5 GiB. The pinned host
+    pool never calls cudaFreeHost on free, so it has to be drained explicitly.
+    """
+    if not torch.accelerator.is_available():
+        return
+    # Finish in-flight copies before either pool releases their buffers.
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+    if host_empty_cache is not None:
+        host_empty_cache()
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     DeepseekV4VLMultiModalProcessor,
     info=DeepseekV4VLProcessingInfo,
@@ -360,6 +379,7 @@ class DeepseekV41ForCausalLM(
             loaded_params = self._load_weights_sliced(loader, mapped)
         # The child's load_weights already ran its post-load finalization.
         self._weights_finalized = True
+        _release_load_pools()
         return loaded_params
 
     def _load_weights_sliced(
