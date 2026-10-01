@@ -214,8 +214,14 @@ class DeepseekV41ForCausalLM(
             and self.hf_to_vllm_mapper.map_name("mtp.0.attn.wq_b.weight") is None
         ):
             # The mapper drops the MTP/DSpark draft weights, so do not read
-            # them: the draft model loads them itself.
-            self.skip_checkpoint_tensor = _is_mtp_tensor
+            # them: the draft model loads them itself. Keep the class-level
+            # Engram skip: an instance attribute shadows it.
+            engram_skip = getattr(type(self), "skip_checkpoint_tensor", None)
+            self.skip_checkpoint_tensor = (
+                _is_mtp_tensor
+                if engram_skip is None
+                else lambda name: _is_mtp_tensor(name) or engram_skip(name)
+            )
 
     def _parse_and_validate_image_input(
         self, **kwargs: object
