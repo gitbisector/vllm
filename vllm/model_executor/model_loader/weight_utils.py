@@ -786,6 +786,60 @@ def filter_mm_encoder_only_safetensors_files(
     return kept
 
 
+def filter_skipped_safetensors_files(
+    hf_weights_files: list[str],
+    hf_folder: str,
+    index_file: str,
+    skip_tensor: Callable[[str], bool],
+) -> list[str]:
+    """Drop safetensors shards whose every tensor the model skips.
+
+    ``skip_tensor`` is the model's ``skip_checkpoint_tensor``. The iterators
+    already skip those tensors, but still open every shard; this avoids
+    touching the shards that hold nothing else (e.g. a speculative draft that
+    reads a few shards of its target's checkpoint). Decided from the index
+    alone, so every rank keeps the same files. Without an index, or if no
+    shard would be kept, returns ``hf_weights_files`` unchanged.
+    """
+    index_path = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_path):
+        return hf_weights_files
+
+    with open(index_path) as f:
+        weight_map: dict[str, str] = json.load(f)["weight_map"]
+
+    needed = {
+        weight_file
+        for weight_name, weight_file in weight_map.items()
+        if not skip_tensor(weight_name)
+    }
+    listed = set(weight_map.values())
+
+    def _keep(path: str) -> bool:
+        # Index weight_map values are usually basenames; tolerate either form.
+        names = (os.path.relpath(path, hf_folder), os.path.basename(path))
+        # A file the index does not list (e.g. an extra matched glob) is kept.
+        return any(n in needed for n in names) or not any(n in listed for n in names)
+
+    kept = [path for path in hf_weights_files if _keep(path)]
+    if not kept:
+        logger.warning(
+            "Every tensor in %s is skipped by the model; reading all %d shards",
+            index_path,
+            len(hf_weights_files),
+        )
+        return hf_weights_files
+    if len(kept) < len(hf_weights_files):
+        logger.info(
+            "Reading %d of %d safetensors shards; the model skips every tensor "
+            "in the rest: %s",
+            len(kept),
+            len(hf_weights_files),
+            ", ".join(os.path.basename(f) for f in kept),
+        )
+    return kept
+
+
 # explicitly use pure text format, with a newline at the end
 # this makes it impossible to see the animation in the progress bar
 # but will avoid messing up with ray or multiprocessing, which wraps

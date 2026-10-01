@@ -70,6 +70,11 @@ _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 _CONTEXT_WKV_RE = re.compile(r"^mtp\.(\d+)\.attn\.wkv\.(.+)$")
 
 
+def _skip_target_tensor(name: str) -> bool:
+    """The draft loads only ``mtp.*``; the rest of the checkpoint is the target's."""
+    return not name.startswith("mtp.")
+
+
 def _duplicate_context_wkv_weights(
     weights: Iterable[tuple[str, torch.Tensor]], num_layers: int
 ) -> Iterable[tuple[str, torch.Tensor]]:
@@ -357,6 +362,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
+        if envs.DSV41_DRAFT_SHARD_FILTER:
+            # The draft's weights are a few shards of the target checkpoint;
+            # the loader then reads only those (skip_checkpoint_tensor).
+            self.skip_checkpoint_tensor = _skip_target_tensor
         self.quant_config = vllm_config.quant_config
         self.pad_shared_expert = getattr(
             self.quant_config, "weight_block_size", None

@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
     VLLM_FASTSAFETENSORS_ALL_LOCAL: bool = False
     VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET: int = -1
+    DSV41_DRAFT_SHARD_FILTER: bool = True
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_TRITON_JIT_WARMUP_NUM_THREADS: int = 4
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
@@ -1159,6 +1160,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET": lambda: int(
         os.getenv("VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET", "-1")
     ),
+    # DeepSeek-V4/V4.1 DSpark draft: read only the checkpoint shards that hold
+    # its mtp.* tensors (per the safetensors index) instead of re-reading the
+    # whole target checkpoint. 0 reads every shard.
+    "DSV41_DRAFT_SHARD_FILTER": lambda: os.getenv("DSV41_DRAFT_SHARD_FILTER", "1")
+    == "1",
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
@@ -2449,6 +2455,7 @@ def compile_factors() -> dict[str, object]:
         "NO_COLOR",
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
+        "DSV41_DRAFT_SHARD_FILTER",
     }
 
     from vllm.config.utils import normalize_value
