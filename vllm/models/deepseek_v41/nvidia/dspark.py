@@ -301,8 +301,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.config = self.draft_model_config.hf_config
         if envs.DSV41_DRAFT_SHARD_FILTER:
             # The draft's weights are a few shards of the target checkpoint;
-            # the loader then reads only those (skip_checkpoint_tensor).
-            self.skip_checkpoint_tensor = _skip_target_tensor
+            # the loader then reads only those (skip_checkpoint_tensor). Keep
+            # the class-level Engram skip: an instance attribute shadows it.
+            engram_skip = getattr(type(self), "skip_checkpoint_tensor", None)
+            self.skip_checkpoint_tensor = (
+                _skip_target_tensor
+                if engram_skip is None
+                else lambda name: _skip_target_tensor(name) or engram_skip(name)
+            )
         self.quant_config = vllm_config.quant_config
         self.linear_scale_name = _linear_scale_param_name(
             vllm_config, getattr(self.config, "expert_dtype", "fp4")
