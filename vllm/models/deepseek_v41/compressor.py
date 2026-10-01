@@ -75,8 +75,14 @@ def _ring_slot_mapping_kernel(
     block = tl.load(block_table_ptr + req * block_table_stride, mask=valid, other=0)
     pos = tl.load(positions_ptr + offsets, mask=valid, other=0)
     slot = block.to(tl.int64) * CAPACITY + pos % CAPACITY
+    # Block 0 is the null block, which dummy runs place every request in. The
+    # ring's fp32 rows there alias other groups' null pages in the packed KV
+    # layout (e.g. SWA layer 0 row 0), whose fp8 readers then see NaN bytes:
+    # never write it. Real requests' rings never live in block 0.
     tl.store(
-        slot_mapping_ptr + offsets, tl.where(valid, slot, -1), mask=offsets < num_tokens
+        slot_mapping_ptr + offsets,
+        tl.where(valid & (block > 0), slot, -1),
+        mask=offsets < num_tokens,
     )
 
 
