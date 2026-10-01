@@ -126,6 +126,9 @@ if TYPE_CHECKING:
     VLLM_FASTSAFETENSORS_ALL_LOCAL: bool = False
     VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET: int = -1
     DSV41_DRAFT_SHARD_FILTER: bool = True
+    DSV41_SLICE_READ: bool = False
+    DSV41_TARGET_SKIP_MTP: bool = False
+    DSV41_SLICE_VERIFY: str = ""
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_TRITON_JIT_WARMUP_NUM_THREADS: int = 4
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
@@ -1165,6 +1168,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whole target checkpoint. 0 reads every shard.
     "DSV41_DRAFT_SHARD_FILTER": lambda: os.getenv("DSV41_DRAFT_SHARD_FILTER", "1")
     == "1",
+    # DeepSeek-V4.1 under fastsafetensors with ALL_LOCAL: each TP rank reads only
+    # its rows of the audited row-sharded tensors
+    # (vllm/models/deepseek_v41/nvidia/slice_read.py).
+    "DSV41_SLICE_READ": lambda: os.getenv("DSV41_SLICE_READ", "0") == "1",
+    # DeepSeek-V4.1 VL target: do not read mtp.* tensors, which its mapper drops
+    # anyway (the DSpark draft reads them itself).
+    "DSV41_TARGET_SKIP_MTP": lambda: os.getenv("DSV41_TARGET_SKIP_MTP", "0") == "1",
+    # Directory to write a per-rank sha256 of every loaded DeepSeek-V4.1
+    # parameter into, to compare loads byte for byte. Empty disables it.
+    "DSV41_SLICE_VERIFY": lambda: os.getenv("DSV41_SLICE_VERIFY", ""),
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
@@ -2456,6 +2469,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
         "DSV41_DRAFT_SHARD_FILTER",
+        "DSV41_SLICE_READ",
+        "DSV41_TARGET_SKIP_MTP",
+        "DSV41_SLICE_VERIFY",
     }
 
     from vllm.config.utils import normalize_value
