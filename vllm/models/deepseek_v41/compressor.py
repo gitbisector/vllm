@@ -160,6 +160,8 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.state_dim,
             head_size_v=0,
             dtype=self.dtype,
+            # Every DCP rank compresses every token: the ring is replicated.
+            dcp_sharded=False,
         )
 
     def forward(self): ...

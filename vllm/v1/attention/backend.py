@@ -626,6 +626,13 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         self.vllm_config = vllm_config
         self.device = device
         self.kernel_block_size: int | None = None
+        # The DCP geometry this builder's group runs at: the process DCP group
+        # for sharded caches, (1, 0) for caches every rank holds in full.
+        from vllm.distributed.parallel_state import get_dcp_world_size_and_rank
+
+        self.dcp_world_size, self.dcp_rank = get_dcp_world_size_and_rank(
+            getattr(kv_cache_spec, "dcp_sharded", False)
+        )
 
     def set_kernel_block_size(self, kernel_block_size: int) -> None:
         self.kernel_block_size = kernel_block_size
@@ -684,10 +691,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                     max_decode_query_len(self.vllm_config),
                 )
 
-        if (
-            self.vllm_config.parallel_config.decode_context_parallel_size > 1
-            and not supports_dcp_with_varlen
-        ):
+        if self.dcp_world_size > 1 and not supports_dcp_with_varlen:
             self.reorder_batch_threshold = 1
 
     @abstractmethod
