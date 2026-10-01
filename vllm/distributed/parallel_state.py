@@ -677,6 +677,7 @@ class GroupCoordinator:
 
         # only cuda/rocm uses this function,
         # so we don't abstract it into the base class
+        maybe_b12x_context: AbstractContextManager[Any] = nullcontext()
         maybe_ca_context = nullcontext()
         maybe_fi_pcie_ipc_context: AbstractContextManager[Any] = nullcontext()
         maybe_aiter_ar_context = nullcontext()
@@ -692,6 +693,11 @@ class GroupCoordinator:
                 self.device_communicator,
                 (CudaCommunicator, XpuCommunicator),
             )
+            # RoCEnante: compile/allocate before capture and pin the capture
+            # stream; the runtime refuses both inside a graph.
+            b12x_ar_comm = getattr(self.device_communicator, "b12x_ar_comm", None)
+            if b12x_ar_comm is not None:
+                maybe_b12x_context = b12x_ar_comm.capture(stream=stream)
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
@@ -713,6 +719,7 @@ class GroupCoordinator:
 
         with (
             torch.cuda.stream(stream),
+            maybe_b12x_context,
             maybe_ca_context,
             maybe_fi_pcie_ipc_context,
             maybe_aiter_ar_context,

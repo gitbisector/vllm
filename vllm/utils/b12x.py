@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Accessors for the optional ``b12x`` package."""
 
+import functools
 import importlib
 import importlib.util
 from collections.abc import Callable, Hashable, Iterable
@@ -76,6 +77,13 @@ def get_b12x_fused_moe() -> ModuleType | None:
 
 def get_b12x_paged_attention() -> ModuleType | None:
     return _get_submodule("b12x.attention.paged")
+
+
+@functools.cache
+def get_b12x_comm_roce() -> ModuleType | None:
+    # Imported on first use rather than with the submodules above: the RoCE
+    # runtime is opt-in (VLLM_ENABLE_ROCE_ALLREDUCE) and needs RDMA devices.
+    return _import_submodule("b12x.comm.roce")
 
 
 def b12x_warmup_token_counts(

@@ -275,6 +275,11 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
+    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
+    VLLM_ROCE_ALLGATHER_ENABLE: bool = True
+    VLLM_ROCE_GROUPS: str = ""
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1950,6 +1955,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
     ),
+    # b12x RoCEnante (b12x.comm.roce) one-shot RoCE all-reduce/all-gather for
+    # multi-node TP on DGX Spark. Opt-in; needs b12x with comm.roce API 1.
+    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    # Largest all-reduce routed to RoCEnante; larger ones stay on NCCL.
+    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+    ),
+    # Largest per-rank shard routed to the RoCEnante all-gather
+    # (e.g. logits [rows, vocab/tp]).
+    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+    ),
+    # 0 keeps all-gathers on NCCL while all-reduces use RoCEnante.
+    "VLLM_ROCE_ALLGATHER_ENABLE": lambda: bool(
+        int(os.getenv("VLLM_ROCE_ALLGATHER_ENABLE", "1"))
+    ),
+    # Comma-separated process-group names that may use RoCEnante. Only "tp" is
+    # supported: listing it enables RoCEnante on the TP group even when custom
+    # all-reduce is disabled. Other groups are ignored with a warning, since
+    # only TP, PP and DP enter graph capture for their communicators.
+    "VLLM_ROCE_GROUPS": lambda: os.getenv("VLLM_ROCE_GROUPS", ""),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2372,6 +2400,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
+        # Collective routing happens inside the all-reduce custom op at run
+        # time; it does not change compiled graphs.
+        "VLLM_ENABLE_ROCE_ALLREDUCE",
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE",
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE",
+        "VLLM_ROCE_ALLGATHER_ENABLE",
+        "VLLM_ROCE_GROUPS",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

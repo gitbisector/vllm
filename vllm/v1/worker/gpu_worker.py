@@ -184,6 +184,30 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
+    """An asynchronous output whose completion is followed by the RoCEnante check.
+
+    From local-inference-lab/vllm#597 (Jason, @original-el8).
+    """
+
+    def __init__(
+        self, inner: AsyncModelRunnerOutput, check: Callable[[], None]
+    ) -> None:
+        self._inner = inner
+        self._check = check
+
+    def get_output(self) -> ModelRunnerOutput:
+        output = self._inner.get_output()
+        self._check()
+        return output
+
+    def __getattr__(self, name: str):
+        # Forward anything else (e.g. per-runner attributes) to the wrapped output.
+        if name in ("_inner", "_check"):
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -1236,7 +1260,47 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
+
+    def _b12x_roce_health_check(self) -> Callable[[], None] | None:
+        """The RoCEnante health check of every live runtime on this process.
+
+        Fail-stop only works if every process group running a RoCEnante
+        backend is checked here: a runtime on an unchecked group could time
+        out without ever raising, letting the step's output leave the worker
+        with silently wrong results instead of the intended fail-stop.
+        """
+        if not envs.VLLM_ENABLE_ROCE_ALLREDUCE:
+            return None
+        from vllm.distributed.device_communicators.b12x_roce_all_reduce import (
+            live_runtimes,
+        )
+
+        checks = [runtime.check_health for runtime in live_runtimes()]
+        if not checks:
+            return None
+
+        def check_all() -> None:
+            for check in checks:
+                check()
+
+        return check_all
+
+    def _b12x_roce_guarded(self, output):
+        """Fail-stop RoCEnante check once the step's output is on the host.
+
+        A synchronous output already holds the sampled tokens on the host, so
+        every collective of the step has completed and the check runs now; an
+        asynchronous output is wrapped so the check runs right after its
+        ``get_output()`` completes the copy (local-inference-lab/vllm#597).
+        """
+        check = self._b12x_roce_health_check()
+        if check is None:
+            return output
+        if isinstance(output, AsyncModelRunnerOutput):
+            return _B12xRoceCheckedAsyncOutput(output, check)
+        check()
+        return output
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1313,7 +1377,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
-                return output
+                return self._b12x_roce_guarded(output)
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
