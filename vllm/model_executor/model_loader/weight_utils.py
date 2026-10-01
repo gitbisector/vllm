@@ -1040,13 +1040,21 @@ def safetensors_weights_iterator(
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    skip_tensor: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
-    reduces storage I/O for MoE models under EP.
+    reduces storage I/O for MoE models under EP. *skip_tensor* names further
+    checkpoint tensors the model never loads; they are skipped the same way.
     """
+
+    def skip(name: str) -> bool:
+        return should_skip_weight(name, local_expert_ids) or (
+            skip_tensor is not None and skip_tensor(name)
+        )
+
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
@@ -1128,7 +1136,7 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
+                if not skip(name):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -1145,7 +1153,7 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if skip(name):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -1163,7 +1171,7 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if skip(name):
                         continue
                     param = f.get_tensor(name)
                     yield name, param
@@ -1380,6 +1388,7 @@ def fastsafetensors_weights_iterator(
     use_tqdm_on_load: bool,
     accumulate_resident: bool = False,
     local_expert_ids: set[int] | None = None,
+    skip_tensor: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using fastsafetensor library.
@@ -1397,6 +1406,9 @@ def fastsafetensors_weights_iterator(
         local_expert_ids: Experts this rank owns under expert parallelism, or
             None to load every expert. Expert weights outside the set are
             skipped, matching the default loader.
+        skip_tensor: Checkpoint tensors the model never loads, or None. They
+            are never read and are left out of the memory plan, so a model
+            can keep large tables on disk without the loader staging them.
 
     Note:
         Collective. Every rank must call this the same number of times in the
@@ -1439,19 +1451,23 @@ def fastsafetensors_weights_iterator(
 
     # Skip expert weights this rank does not own, as the default path does:
     # experts are ~85-90% of weight bytes, so under EP this otherwise reads
-    # roughly an order of magnitude more than --load-format auto.
+    # roughly an order of magnitude more than --load-format auto. Skip too
+    # whatever the model says it never loads.
     keep_tensor: Callable[[str], bool] | None = None
-    if local_expert_ids is not None:
+    if local_expert_ids is not None or skip_tensor is not None:
 
         def keep_tensor(name: str) -> bool:  # noqa: F811
-            return not should_skip_weight(name, local_expert_ids)
+            return not (
+                should_skip_weight(name, local_expert_ids)
+                or (skip_tensor is not None and skip_tensor(name))
+            )
 
         # A filter is incompatible with broadcast (get_tensor would deliver
         # tensors this rank never read). Filtering is the larger win, so switch
         # rather than surface a library ValueError.
         if not all_local:
             logger.info(
-                "fastsafetensors: expert filtering requires all_local; "
+                "fastsafetensors: tensor filtering requires all_local; "
                 "enabling it (VLLM_FASTSAFETENSORS_ALL_LOCAL=0 ignored)."
             )
             all_local = True
@@ -1554,7 +1570,10 @@ def fastsafetensors_weights_iterator(
 
     if lazy_files:
         yield from safetensors_weights_iterator(
-            lazy_files, use_tqdm_on_load, local_expert_ids=local_expert_ids
+            lazy_files,
+            use_tqdm_on_load,
+            local_expert_ids=local_expert_ids,
+            skip_tensor=skip_tensor,
         )
     if not hf_weights_files:
         return

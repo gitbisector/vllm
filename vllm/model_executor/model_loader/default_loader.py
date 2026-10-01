@@ -6,7 +6,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -84,6 +84,9 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         self.local_expert_ids: set[int] | None = None
+        # Set in load_weights from the model's optional skip_checkpoint_tensor:
+        # checkpoint tensors it never loads, e.g. tables it serves from disk.
+        self.skip_tensor: Callable[[str], bool] | None = None
         # Set in load_weights when --mm-encoder-only; used to drop LM-only shards.
         self._encoder_only_lm_prefixes: tuple[str, ...] | None = None
         self._encoder_only_weights_mapper: WeightsMapper | None = None
@@ -304,6 +307,7 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                     accumulate_resident=self.params_materialize_during_load,
                     local_expert_ids=self.local_expert_ids,
+                    skip_tensor=self.skip_tensor,
                 )
             elif self.load_config.load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
@@ -331,6 +335,7 @@ class DefaultModelLoader(BaseModelLoader):
                         safetensors_prefetch_block_size=(
                             self.load_config.safetensors_prefetch_block_size
                         ),
+                        skip_tensor=self.skip_tensor,
                     )
         else:
             if extra_config.get("enable_multithread_load"):
@@ -351,6 +356,13 @@ class DefaultModelLoader(BaseModelLoader):
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
+        # The iterators above skip these before reading where they can; this
+        # catches the formats that cannot, so a model never sees them.
+        if self.skip_tensor is not None:
+            skip = self.skip_tensor
+            weights_iterator = (
+                (name, tensor) for (name, tensor) in weights_iterator if not skip(name)
+            )
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -483,6 +495,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
         self._init_mm_encoder_only_weight_filter(model, model_config)
+        # Must be rank-identical: under fastsafetensors it shapes the memory
+        # plan, which every rank has to compute alike.
+        self.skip_tensor = getattr(model, "skip_checkpoint_tensor", None)
 
         # Every quant method reachable from this loader creates its parameters
         # in create_weights at model-init time, so the load only copies into
