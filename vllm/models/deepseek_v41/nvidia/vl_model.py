@@ -16,13 +16,19 @@ Thin multimodal wrapper around the text-only ``DeepseekV41LLMForCausalLM``:
   (``requires_raw_input_tokens``).
 """
 
+import time
 from collections.abc import Iterable
 from typing import Annotated
 
 import torch
 from torch import nn
 
-from vllm.distributed import get_tensor_model_parallel_world_size
+import vllm.envs as envs
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -59,6 +65,8 @@ from .model import (
     _linear_scale_param_name,
     _make_deepseek_v4_weights_mapper,
 )
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4VLImagePixelInputs(TensorSchema):
@@ -109,6 +117,10 @@ def _make_deepseek_v4_vl_weights_mapper(
             "mtp.": None,
         },
     )
+
+
+def _is_mtp_tensor(name: str) -> bool:
+    return name.startswith("mtp.")
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -197,6 +209,13 @@ class DeepseekV41ForCausalLM(
         self.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
             expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
         )
+        if (
+            envs.DSV41_TARGET_SKIP_MTP
+            and self.hf_to_vllm_mapper.map_name("mtp.0.attn.wq_b.weight") is None
+        ):
+            # The mapper drops the MTP/DSpark draft weights, so do not read
+            # them: the draft model loads them itself.
+            self.skip_checkpoint_tensor = _is_mtp_tensor
 
     def _parse_and_validate_image_input(
         self, **kwargs: object
@@ -329,9 +348,47 @@ class DeepseekV41ForCausalLM(
         # weights must reach it as one contiguous group.
         mapped = stream_language_model_first(self.hf_to_vllm_mapper.apply(weights))
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
+        if not (envs.DSV41_SLICE_READ or envs.DSV41_SLICE_VERIFY):
+            loaded_params = loader.load_weights(mapped)
+        else:
+            loaded_params = self._load_weights_sliced(loader, mapped)
         # The child's load_weights already ran its post-load finalization.
         self._weights_finalized = True
+        return loaded_params
+
+    def _load_weights_sliced(
+        self,
+        loader: AutoWeightsLoader,
+        mapped: Iterable[tuple[str, torch.Tensor]],
+    ) -> set[str]:
+        """Load with slice-read able to check this model's parameters.
+
+        The fastsafetensors planner runs lazily inside the first next() of the
+        weight stream, i.e. inside load_weights, and checks the registered
+        model before slicing anything. It is cleared afterwards, so the draft
+        pass, whose loaders are not audited, never slices.
+        """
+        from . import slice_read
+
+        rb0, t0 = slice_read.proc_read_bytes(), time.perf_counter()
+        slice_read.MODEL = self
+        try:
+            loaded_params = loader.load_weights(mapped)
+        finally:
+            slice_read.MODEL = None
+        read_bytes = slice_read.proc_read_bytes() - rb0
+        seconds = time.perf_counter() - t0
+        logger.info(
+            "DSV41 slice-read: target load_weights %.1f s, read_bytes %.2f GiB",
+            seconds,
+            read_bytes / (1 << 30),
+        )
+        slice_read.dump_checksums(
+            self,
+            loaded_params,
+            get_tensor_model_parallel_rank(),
+            {"target_load_seconds": round(seconds, 2), "target_read_bytes": read_bytes},
+        )
         return loaded_params
 
     def process_weights_after_loading(self) -> None:

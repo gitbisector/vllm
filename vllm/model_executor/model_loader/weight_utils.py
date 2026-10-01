@@ -1578,7 +1578,7 @@ def fastsafetensors_weights_iterator(
             budget = None
     nogds = nogds or budget is not None
 
-    def _make_loader(nogds: bool) -> "ParallelLoader":
+    def _make_unsliced_loader(nogds: bool) -> "ParallelLoader":
         kwargs = dict(
             pg=pg,
             hf_weights_files=hf_weights_files,
@@ -1614,6 +1614,23 @@ def fastsafetensors_weights_iterator(
                 "the memory bound and stages whole shards, which is likely to "
                 "run out of memory during loading."
             ) from e
+
+    def _make_loader(nogds: bool) -> "ParallelLoader":
+        if not envs.DSV41_SLICE_READ:
+            return _make_unsliced_loader(nogds)
+        # DeepSeek-V4.1: read only this TP rank's rows of row-sharded tensors.
+        # The planner runs inside ParallelLoader.__init__, so the patch only
+        # has to cover construction.
+        from vllm.distributed import get_tensor_model_parallel_world_size
+        from vllm.models.deepseek_v41.nvidia import slice_read
+
+        with slice_read.sliced_planner(
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+            all_local,
+            planned=budget is not None,
+        ):
+            return _make_unsliced_loader(nogds)
 
     logger.info(
         "fastsafetensors: %s (%s)%s",
