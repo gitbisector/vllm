@@ -163,3 +163,31 @@ def test_dcp1_keeps_replay_pad():
         compress_ratio=2,
     )
     assert out.tolist() == [-1, -1, -1, -1, -1, 3 * 4 + 2, -1, 3 * 4 + 3]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rank", [0, 1])
+def test_dcp_padding_rows_write_nothing(rank):
+    """CUDA-graph padding requests (past num_tokens, seq_len 0) stay PAD under
+    DCP, where the token slot no longer gates the write."""
+    device = "cuda"
+    # One real 10-token prefill, then a padding request holding 4 query rows.
+    query_start_loc = torch.tensor([0, 10, 14], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([10, 0], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[5], [123456]], dtype=torch.int32, device=device)
+    buffer = torch.empty(16, dtype=torch.int64, device=device)
+    get_compressed_slot_mapping(
+        10,
+        torch.full((14,), PAD, dtype=torch.int64, device=device),
+        query_start_loc,
+        seq_lens,
+        block_table,
+        4,
+        2,
+        out=buffer,
+        dcp_world_size=2,
+        dcp_rank=rank,
+    )
+    real = [5 * 4 + i for i in range(3 - rank)]
+    assert [s for s in buffer.tolist()[:10] if s != PAD] == real
+    assert buffer.tolist()[10:] == [PAD] * 6

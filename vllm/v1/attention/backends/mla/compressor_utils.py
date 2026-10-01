@@ -42,7 +42,7 @@ class CompressedSlotMappingKernel(
         dcp_interleave: int = 1
 
     @staticmethod
-    @triton.jit(do_not_specialize=["block_table_stride"])
+    @triton.jit(do_not_specialize=["block_table_stride", "num_tokens"])
     def kernel(
         # [num_tokens]
         compressed_slot_mapping_ptr,
@@ -57,6 +57,8 @@ class CompressedSlotMappingKernel(
         block_table_stride,
         # states per page on this rank
         block_size,
+        # tokens of real requests; later ones are CUDA-graph padding
+        num_tokens,
         COMPRESS_RATIO: tl.constexpr,
         PAD_ID: tl.constexpr,
         TRITON_BLOCK_SIZE: tl.constexpr,
@@ -89,7 +91,13 @@ class CompressedSlotMappingKernel(
                 # token's own slot is PAD on every rank that does not own the
                 # TOKEN, so it says nothing about the state; bounded replay,
                 # the only other source of PAD here, is off under DCP.
-                is_valid = (pos + 1) % COMPRESS_RATIO == 0
+                # Padding rows (past num_tokens, or with negative positions) never
+                # write; DCP1 relies on their PAD token slot for that.
+                is_valid = (
+                    ((pos + 1) % COMPRESS_RATIO == 0)
+                    & (pos >= 0)
+                    & (query_start + offset < num_tokens)
+                )
                 virtual_block_size = block_size * DCP_WORLD
                 virtual_off = state % virtual_block_size
                 is_valid = is_valid & (
@@ -183,6 +191,7 @@ class CompressedSlotMappingKernel(
             seq_lens=int32_ptr,
             block_table=int32_ptr,
             block_size=compile_key.block_size,
+            num_tokens=1,
             compress_ratio=compile_key.compress_ratio,
             dcp_world_size=compile_key.dcp_world,
             dcp_rank=compile_key.dcp_rank,
@@ -198,6 +207,7 @@ class CompressedSlotMappingKernel(
         seq_lens: torch.Tensor,
         block_table: torch.Tensor,
         block_size: int,
+        num_tokens: int,
         compress_ratio: int,
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
@@ -266,6 +276,7 @@ def get_compressed_slot_mapping(
         seq_lens,
         block_table,
         block_size,
+        num_tokens,
         compress_ratio,
         dcp_world_size,
         dcp_rank,
