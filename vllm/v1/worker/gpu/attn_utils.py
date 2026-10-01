@@ -473,6 +473,9 @@ def build_attn_metadata(
             continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
+        # Groups DCP does not shard hold every position on every rank, so
+        # their builders see the global seq_lens, not this rank's share.
+        dcp_sharded = kv_cache_config.kv_cache_groups[i].kv_cache_spec.dcp_sharded
         # Per-group causal for hybrid drafters (mixed SWA/full attention).
         group_causal = (
             causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
@@ -506,8 +509,10 @@ def build_attn_metadata(
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
             causal=group_causal,
-            dcp_local_seq_lens=dcp_local_seq_lens,
-            dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+            dcp_local_seq_lens=dcp_local_seq_lens if dcp_sharded else None,
+            dcp_local_seq_lens_cpu_upper_bound=(
+                dcp_local_seq_lens_cpu_upper_bound if dcp_sharded else None
+            ),
             positions=positions,
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,

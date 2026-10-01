@@ -136,6 +136,9 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             alignment=self.packed_page_alignment if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
+            # DCP: the window is tiny, so every rank keeps all of it and the
+            # sliding-window attention needs no cross-rank combine.
+            dcp_sharded=False,
         )
 
     def forward(self): ...
@@ -439,6 +442,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int | None = None
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_draft_decode_metadata_update = True
+    # The SWA cache is DCP-replicated, so DSpark's non-causal multi-token decode
+    # needs no cross-rank combine here.
+    supports_non_causal_multi_token_dcp: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
