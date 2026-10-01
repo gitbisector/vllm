@@ -139,12 +139,18 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     req_id_per_token: torch.Tensor
     block_size: int
     topk_tokens: int
+    # Global per-request lengths (tokens) on the host: exact for prefill rows,
+    # an upper bound for decode rows. DCP prefill sizes its KV gather from it.
+    seq_lens_cpu: torch.Tensor | None = None
 
 
 class DeepseekV4SparseMLAMetadataBuilder(
     AttentionMetadataBuilder[DeepseekV4FlashMLAMetadata]
 ):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # DCP combines the partial attention per token, so DSpark's non-causal
+    # multi-token decode stays a decode under DCP.
+    supports_non_causal_multi_token_dcp: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -155,9 +161,23 @@ class DeepseekV4SparseMLAMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.model_config = vllm_config.model_config
+        # The compressed cache is DCP-sharded over compressed states
+        # (self.dcp_world_size / dcp_rank come from the base builder).
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
+        if self.dcp_world_size > 1 and self.cp_kv_cache_interleave_size != 1:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 DCP supports cp_kv_cache_interleave_size=1 only "
+                f"(got {self.cp_kv_cache_interleave_size})."
+            )
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to prefill.
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # Under DCP the attention combines per token, so multi-token decodes
+        # stay decodes and the split matches the SWA builder's.
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=True, supports_dcp_with_varlen=True
+        )
         self.topk_tokens = self.model_config.hf_config.index_topk
 
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -202,6 +222,9 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 int(self.kv_cache_spec.num_states),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
+                dcp_world_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
 
         return DeepseekV4FlashMLAMetadata(
@@ -215,6 +238,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
+            seq_lens_cpu=cm.seq_lens_cpu_upper_bound,
         )
 
 
