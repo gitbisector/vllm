@@ -101,7 +101,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from ..common.engram import EngramLayout, NgramHashState
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from .engram import Engram, can_share_engram_tables, gather_engram_hashes
-from .engram_disk import skip_engram_checkpoint_tensor
+from .engram_disk import ENGRAM_DISK, skip_engram_checkpoint_tensor
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
     init_mhc_all_reduce,
@@ -1500,9 +1500,11 @@ class DeepseekV41LLMForCausalLM(
     # The MTP draft head is not LoRA-adapted.
     lora_skip_prefixes = ["mtp."]
 
-    # DSV41_ENGRAM_DISK=1 serves the Engram tables from disk (engram_disk.py);
-    # the loader then never reads them.
-    skip_checkpoint_tensor = staticmethod(skip_engram_checkpoint_tensor)
+    # DSV41_ENGRAM_DISK=1 serves the Engram tables from disk (engram_disk.py),
+    # so the loader never reads them. Defined only then, as any hook makes
+    # fastsafetensors filter tensors.
+    if ENGRAM_DISK:
+        skip_checkpoint_tensor = staticmethod(skip_engram_checkpoint_tensor)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
