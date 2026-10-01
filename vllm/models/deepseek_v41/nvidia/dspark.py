@@ -52,6 +52,7 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
+from .engram_disk import skip_engram_checkpoint_tensor
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
@@ -282,6 +283,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
     draft_id_to_target_id = None
+    # The draft loads from the target checkpoint, whose Engram tables
+    # DSV41_ENGRAM_DISK=1 serves from disk (engram_disk.py): never read them.
+    skip_checkpoint_tensor = staticmethod(skip_engram_checkpoint_tensor)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
