@@ -43,8 +43,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # A DeepSeek-V4(.1) draft is sliding-window only: its caches are
         # DCP-replicated and its attention never needs the DCP combine, so the
         # whole draft runs at DCP1 under a DCP target.
+        draft_text_config = getattr(draft_model_config, "hf_text_config", None)
         draft_shards_kv = draft_model_config.use_mla and (
-            draft_model_config.hf_config.model_type
+            getattr(draft_text_config, "model_type", None)
             not in ("deepseek_v4", "deepseek_v41")
         )
         vllm_config = copy.copy(vllm_config)

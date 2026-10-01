@@ -141,3 +141,33 @@ def test_runner_marks_only_replicated_draft_caches(monkeypatch, draft_dcp_size):
 
     assert specs["target"].dcp_sharded
     assert specs["draft"].dcp_sharded == (draft_dcp_size == 4)
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41"])
+def test_sliding_window_dsv4_draft_runs_at_dcp1(monkeypatch, model_type):
+    """A DeepSeek-V4(.1) DSpark draft is sliding-window only: whole-draft DCP1."""
+    target_parallel = ParallelConfig(
+        tensor_parallel_size=4,
+        decode_context_parallel_size=2,
+        distributed_executor_backend="mp",
+    )
+    target_config = SimpleNamespace(
+        parallel_config=target_parallel,
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                use_mla=True, hf_text_config=SimpleNamespace(model_type=model_type)
+            )
+        ),
+    )
+
+    class CapturedConfig(Exception):
+        pass
+
+    def capture_init(self, config, device):
+        raise CapturedConfig(config)
+
+    monkeypatch.setattr(DraftModelSpeculator, "__init__", capture_init)
+    with pytest.raises(CapturedConfig) as captured:
+        DFlashSpeculator(target_config, device=None)
+    assert captured.value.args[0].parallel_config.decode_context_parallel_size == 1
+    assert target_parallel.decode_context_parallel_size == 2

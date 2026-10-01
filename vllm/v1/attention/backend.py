@@ -691,7 +691,12 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                     max_decode_query_len(self.vllm_config),
                 )
 
-        if self.dcp_world_size > 1 and not supports_dcp_with_varlen:
+        dcp_world_size = getattr(
+            self,
+            "dcp_world_size",
+            self.vllm_config.parallel_config.decode_context_parallel_size,
+        )
+        if dcp_world_size > 1 and not supports_dcp_with_varlen:
             self.reorder_batch_threshold = 1
 
     @abstractmethod
