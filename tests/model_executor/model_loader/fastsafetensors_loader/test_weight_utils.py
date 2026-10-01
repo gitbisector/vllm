@@ -72,9 +72,9 @@ def test_fastsafetensors_sub_shard_chunking(monkeypatch):
     fully serial, so the smallest satisfiable budget is 2 x 147 = 294 MiB.
 
     384 MiB therefore sits above the floor and below the shard, forcing the
-    planner to split the shard -- it loads as 4 chunks. Below 294 MiB the plan
-    is infeasible and the loader raises rather than falling back, which
-    test_fastsafetensors_budget_infeasible covers.
+    planner to split the shard -- it loads as 4 chunks. Below 294 MiB the shard
+    cannot be planned and loads from lazy mmap instead, which
+    test_fastsafetensors_budget_below_largest_tensor_loads_lazily covers.
     """
     monkeypatch.setenv(
         "VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET", str(384 * 1024 * 1024)
@@ -87,31 +87,17 @@ def test_fastsafetensors_sub_shard_chunking(monkeypatch):
     not current_platform.is_cuda_alike(),
     reason="fastsafetensors requires NVIDIA/AMD GPUs",
 )
-def test_fastsafetensors_budget_infeasible(monkeypatch):
-    """A budget below the largest tensor must raise, not silently fall back.
+def test_fastsafetensors_budget_below_largest_tensor_loads_lazily(monkeypatch):
+    """A shard the planner cannot place loads from lazy mmap, not an error.
 
-    The planner's floor is set by the largest single tensor, not the shard: it
-    can always split a shard, but never a tensor, and it needs two transient
-    buffers for it. GPT-2's largest tensor (wte.weight) is 147 MiB, so no plan
-    can satisfy a 1 MiB budget; the error reports needing >= 2 x 147 MiB.
-
-    Falling back to whole-shard staging here would need a buffer at least as
-    large as the tensor the plan could not place, so it is more likely to run
-    out of memory, not less. The loader therefore raises with guidance naming
-    the way out. Note the iterator is a generator, so the plan is only built
-    once iteration starts.
+    GPT-2's largest tensor (wte.weight) is 147 MiB, so no plan fits a 1 MiB
+    budget: a chunk must hold that tensor twice. Rather than fail the load,
+    the shard goes through the lazy iterator, which copies tensor by tensor
+    and needs no staging buffer, and must yield identical tensors.
     """
-    from fastsafetensors import BudgetInfeasibleError
-
     monkeypatch.setenv("VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET", str(1024 * 1024))
     with tempfile.TemporaryDirectory() as tmpdir:
-        safetensors = _download_gpt2(tmpdir)
-        with pytest.raises(BudgetInfeasibleError) as excinfo:
-            next(iter(fastsafetensors_weights_iterator(safetensors, True)))
-
-    message = str(excinfo.value)
-    assert "VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET" in message
-    assert "does not fit in the device memory" in message
+        _assert_matches_safetensors(tmpdir)
 
 
 @pytest.mark.skipif(
@@ -125,8 +111,7 @@ def test_fastsafetensors_accumulate_resident_skips_derived_budget(monkeypatch):
     parameters materialize during the load -- online quantization stores a
     smaller quantized parameter than the checkpoint bytes it consumes -- would
     be over-charged and refused a load that fits. The derived budget is
-    therefore skipped for those; the same 1 MiB that makes
-    test_fastsafetensors_budget_infeasible raise must load here.
+    therefore skipped for those, and the load runs unplanned.
     """
     monkeypatch.delenv("VLLM_FASTSAFETENSORS_DEVICE_MEMORY_BUDGET", raising=False)
     with tempfile.TemporaryDirectory() as tmpdir:

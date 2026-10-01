@@ -1465,7 +1465,31 @@ def fastsafetensors_weights_iterator(
         device, pg, derive=not accumulate_resident
     )
     max_batch_bytes = None
+    lazy_files: list[str] = []
     if budget is not None:
+        # A shard whose largest kept tensor cannot be staged twice within the
+        # budget cannot be planned: the planner would raise and fail the whole
+        # load over a few shards. Load those from lazy mmap instead, which
+        # copies tensor by tensor and needs no staging buffer. Typically the
+        # shards holding the embedding and LM head (DeepSeek-V4.1-Flash: 2 of
+        # 48 at a 2 GiB budget). Header-derived and the budget is agreed, so
+        # every rank splits alike.
+        planned = []
+        for f in hf_weights_files:
+            if 2 * _safetensors_extents([f], keep_tensor)[0] <= budget:
+                planned.append(f)
+            else:
+                lazy_files.append(f)
+        if lazy_files:
+            logger.info(
+                "fastsafetensors: %d of %d shards hold a tensor too large for "
+                "the %.2f GiB budget and load via lazy mmap instead: %s",
+                len(lazy_files),
+                len(hf_weights_files),
+                budget / (1 << 30),
+                ", ".join(os.path.basename(f) for f in lazy_files),
+            )
+        hf_weights_files = planned
         largest_tensor, largest_span = _safetensors_extents(
             hf_weights_files, keep_tensor
         )
@@ -1527,6 +1551,13 @@ def fastsafetensors_weights_iterator(
         budget_reason,
         "" if nogds else ", GDS",
     )
+
+    if lazy_files:
+        yield from safetensors_weights_iterator(
+            lazy_files, use_tqdm_on_load, local_expert_ids=local_expert_ids
+        )
+    if not hf_weights_files:
+        return
 
     # GDS can fail either at construction or lazily inside the producer
     # thread during iteration (e.g. cuFileHandleRegister returning
