@@ -70,6 +70,11 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+def _skip_target_tensor(name: str) -> bool:
+    """The draft loads only ``mtp.*``; the rest of the checkpoint is the target's."""
+    return not name.startswith("mtp.")
+
+
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -294,6 +299,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
+        if envs.DSV41_DRAFT_SHARD_FILTER:
+            # The draft's weights are a few shards of the target checkpoint;
+            # the loader then reads only those (skip_checkpoint_tensor).
+            self.skip_checkpoint_tensor = _skip_target_tensor
         self.quant_config = vllm_config.quant_config
         self.linear_scale_name = _linear_scale_param_name(
             vllm_config, getattr(self.config, "expert_dtype", "fp4")

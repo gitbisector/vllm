@@ -31,6 +31,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     filter_mm_encoder_only_safetensors_files,
+    filter_skipped_safetensors_files,
     get_quant_config,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
@@ -290,6 +291,10 @@ class DefaultModelLoader(BaseModelLoader):
                     f"`{source.model_or_path}`; check language_model prefixes "
                     f"{self._encoder_only_lm_prefixes}"
                 )
+        if self.skip_tensor is not None and use_safetensors and hf_weights_files:
+            hf_weights_files = filter_skipped_safetensors_files(
+                hf_weights_files, hf_folder, index_file, self.skip_tensor
+            )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
