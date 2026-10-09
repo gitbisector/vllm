@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+import vllm.v1.attention.ops.triton_unified_attention as unified_attn_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
@@ -984,3 +985,220 @@ def test_softcap_does_not_overflow_on_large_scores() -> None:
     ref = soft_cap * torch.tanh(scores / soft_cap)
     assert torch.isfinite(out).all(), out
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+# sm_86/sm_89/sm_12x (CI's L4 among them) have 101376 B of shared memory per
+# block. At Triton's default stages the 2D launch of a 512-wide 16-bit-query
+# head needs 115968 B with a sliding window and 114944 B with an fp8 KV cache,
+# so both cases fail there with OutOfResources unless one stage is used.
+@pytest.mark.skipif(current_platform.is_rocm(), reason="CUDA shared-memory gate")
+@pytest.mark.parametrize(
+    ("sliding_window", "fp8_kv"),
+    [
+        pytest.param(128, False, id="window"),
+        pytest.param(None, True, id="fp8kv"),
+        pytest.param(128, True, id="window-fp8kv"),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_head512_small_smem(
+    sliding_window: int | None, fp8_kv: bool
+) -> None:
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+
+    seq_lens = [(1, 1328), (5, 18), (129, 463)]
+    num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 512, 16
+    num_blocks = 2048
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.bfloat16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.bfloat16
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+    )
+    output = torch.empty_like(query)
+
+    if fp8_kv:
+        k_scale, v_scale = 0.5, 0.25
+        k, v = (
+            (key_cache / k_scale).to(FP8_DTYPE),
+            (value_cache / v_scale).to(FP8_DTYPE),
+        )
+        scale_shape = (num_seqs, num_kv_heads)
+        k_descale = torch.full(scale_shape, k_scale, dtype=torch.float32)
+        v_descale = torch.full(scale_shape, v_scale, dtype=torch.float32)
+        kv_quant_mode = KVQuantMode.FP8_PER_TENSOR
+        atol = rtol = 1.5e-1
+    else:
+        k, v = key_cache, value_cache
+        k_descale = v_descale = None
+        kv_quant_mode = KVQuantMode.NONE
+        atol = rtol = 1.5e-2
+
+    # seq_threshold_3D=0 forces the 2D launch, the one that overflows.
+    unified_attention(
+        q=query,
+        k=k,
+        v=v,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_t,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        seq_threshold_3D=0,
+        kv_quant_mode=kv_quant_mode,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+    )
+    (
+        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+        (f"{torch.max(torch.abs(output - ref_output))}"),
+    )
+
+
+class _LaunchCapture:
+    """Records the launch kwargs in place of ``kernel_unified_attention``."""
+
+    kwargs: dict
+
+    def __getitem__(self, grid):
+        return self._record
+
+    def _record(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+
+def _capture_launch_config(
+    monkeypatch,
+    *,
+    head_size: int,
+    sliding_window: int | None,
+    kv_dtype: torch.dtype,
+    max_shared_memory: int,
+    is_cuda: bool = True,
+) -> dict:
+    """Capture the launch config with the device predicates mocked.
+
+    Allocates no device memory (meta tensors), so it exercises the
+    shared-memory gate on every CI agent regardless of its GPU.
+    """
+    platform = unified_attn_ops.current_platform
+    monkeypatch.setattr(platform, "is_cuda", lambda: is_cuda)
+    # Keep the B200 ``tuned_large_head`` branch out of the way.
+    monkeypatch.setattr(platform, "is_device_capability_family", lambda *a: False)
+    monkeypatch.setattr(
+        unified_attn_ops, "_device_shared_memory_bytes", lambda _: max_shared_memory
+    )
+    # Meta tensors carry no device index; the gate then asks the accelerator.
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    capture = _LaunchCapture()
+    monkeypatch.setattr(unified_attn_ops, "kernel_unified_attention", capture)
+
+    num_seqs, block_size, num_blocks = 2, 16, 8
+    q = torch.empty(64, 8, head_size, dtype=torch.bfloat16, device="meta")
+    k = torch.empty(num_blocks, block_size, 2, head_size, dtype=kv_dtype, device="meta")
+    v = torch.empty_like(k)
+    out = torch.empty_like(q)
+    seq_lens = torch.empty(num_seqs, dtype=torch.int32, device="meta")
+    cu_seqlens_q = torch.empty(num_seqs + 1, dtype=torch.int32, device="meta")
+    block_table = torch.empty(num_seqs, 4, dtype=torch.int32, device="meta")
+    window = sliding_window - 1 if sliding_window is not None else -1
+    unified_attention(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        32,
+        seq_lens,
+        64,
+        head_size**-0.5,
+        True,
+        (window, 0),
+        block_table,
+        0,
+        1.0,
+        1.0,
+        1.0,
+    )
+    return capture.kwargs
+
+
+# The real launches above cover the 101376 B parts CI runs on; this covers
+# the branches that hardware cannot reach there: a large-smem device (H100,
+# 232448 B) and a non-CUDA platform, where the gate must stay off.
+@pytest.mark.parametrize(
+    (
+        "head_size",
+        "sliding_window",
+        "kv_dtype",
+        "max_shared_memory",
+        "is_cuda",
+        "expect_one_stage",
+    ),
+    [
+        pytest.param(512, 128, torch.bfloat16, 101376, True, True, id="512-window-99k"),
+        pytest.param(512, None, torch.uint8, 101376, True, True, id="512-fp8kv-99k"),
+        pytest.param(
+            512, 128, torch.bfloat16, 232448, True, False, id="512-window-227k"
+        ),
+        pytest.param(
+            512, 128, torch.bfloat16, 101376, False, False, id="512-window-not-cuda"
+        ),
+    ],
+)
+def test_head512_one_stage_on_small_shared_memory(
+    monkeypatch,
+    head_size: int,
+    sliding_window: int | None,
+    kv_dtype: torch.dtype,
+    max_shared_memory: int,
+    is_cuda: bool,
+    expect_one_stage: bool,
+) -> None:
+    kwargs = _capture_launch_config(
+        monkeypatch,
+        head_size=head_size,
+        sliding_window=sliding_window,
+        kv_dtype=kv_dtype,
+        max_shared_memory=max_shared_memory,
+        is_cuda=is_cuda,
+    )
+    if expect_one_stage:
+        assert kwargs["num_stages"] == 1
+    else:
+        assert "num_stages" not in kwargs
