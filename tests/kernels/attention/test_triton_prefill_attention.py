@@ -80,7 +80,7 @@ def ref_masked_attention(
 @pytest.mark.parametrize("max_seq_len", [1024])
 @pytest.mark.parametrize("H_Q", [32])
 @pytest.mark.parametrize("H_KV", [32, 8])
-@pytest.mark.parametrize("D", [128])
+@pytest.mark.parametrize("D", [128, 256])
 @pytest.mark.parametrize("is_causal", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_context_attention(
@@ -248,7 +248,13 @@ class _LaunchCapture:
 
 
 def _capture_tile_config(
-    monkeypatch, *, is_rocm: bool, on_gfx1x: bool, dtype=torch.bfloat16
+    monkeypatch,
+    *,
+    is_rocm: bool,
+    on_gfx1x: bool,
+    dtype=torch.bfloat16,
+    head_dim: int = 128,
+    max_shared_memory: int = 227 * 1024,
 ) -> _LaunchCapture:
     """Capture the tile configuration with the platform predicates mocked.
 
@@ -258,10 +264,14 @@ def _capture_tile_config(
     """
     platform = prefill_ops.current_platform
     monkeypatch.setattr(platform, "is_rocm", lambda: is_rocm)
+    monkeypatch.setattr(platform, "is_cuda", lambda: not is_rocm)
     # Every device this kernel targets is cuda-alike at capability 80 or better,
     # so the stock tile is 128 for 16-bit dtypes.
     monkeypatch.setattr(platform, "is_cuda_alike", lambda: True)
     monkeypatch.setattr(platform, "has_device_capability", lambda *a, **k: True)
+    monkeypatch.setattr(
+        prefill_ops, "_max_shared_memory_bytes", lambda _: max_shared_memory
+    )
     if is_rocm:
         import vllm.platforms.rocm as rocm_platform
 
@@ -275,10 +285,10 @@ def _capture_tile_config(
 
     seq_lens = torch.empty(2, dtype=torch.int32, device="meta")
     context_attention_fwd(
-        meta(256, 8, 128),
-        meta(256, 2, 128),
-        meta(256, 2, 128),
-        meta(256, 8, 128),
+        meta(256, 8, head_dim),
+        meta(256, 2, head_dim),
+        meta(256, 2, head_dim),
+        meta(256, 8, head_dim),
         seq_lens,
         seq_lens,
         128,
@@ -315,3 +325,36 @@ def test_rdna_narrows_the_kv_tile_and_nothing_else(monkeypatch) -> None:
     assert tuned.kwargs.pop("BLOCK_N") != stock.kwargs.pop("BLOCK_N")
     assert tuned.kwargs == stock.kwargs
     assert tuned.grid == stock.grid
+
+
+# Shared memory per block: 99 KiB on sm_86/sm_89/sm_12x, 163 KiB on A100,
+# 227 KiB on H100. The kernel needs (2 * BLOCK_DMODEL + BLOCK) * BLOCK bytes
+# per element (K and V tiles plus the score tile).
+@pytest.mark.parametrize(
+    ("head_dim", "dtype", "max_shared_memory", "expected_block_m"),
+    [
+        # 128-row tile of a 256-wide head needs 160 KiB; 64 rows need 72 KiB.
+        pytest.param(256, torch.bfloat16, 99 * 1024, 64, id="256-bf16-99k"),
+        # A100 keeps the full tile: 160 KiB fits in 163 KiB.
+        pytest.param(256, torch.bfloat16, 163 * 1024, 128, id="256-bf16-163k"),
+        pytest.param(256, torch.bfloat16, 227 * 1024, 128, id="256-bf16-227k"),
+        pytest.param(128, torch.bfloat16, 99 * 1024, 128, id="128-bf16-99k"),
+        # Lk >= 512 already caps the tile at 32; float32 needs 132 KiB there.
+        pytest.param(512, torch.float32, 99 * 1024, 16, id="512-fp32-99k"),
+        pytest.param(512, torch.float32, 227 * 1024, 32, id="512-fp32-227k"),
+        pytest.param(512, torch.bfloat16, 99 * 1024, 32, id="512-bf16-99k"),
+    ],
+)
+def test_tile_fits_shared_memory(
+    monkeypatch, head_dim: int, dtype, max_shared_memory: int, expected_block_m: int
+) -> None:
+    capture = _capture_tile_config(
+        monkeypatch,
+        is_rocm=False,
+        on_gfx1x=False,
+        dtype=dtype,
+        head_dim=head_dim,
+        max_shared_memory=max_shared_memory,
+    )
+    assert capture.kwargs["BLOCK_M"] == expected_block_m
+    assert capture.kwargs["BLOCK_N"] == expected_block_m

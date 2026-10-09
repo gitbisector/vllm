@@ -28,6 +28,7 @@
 It supports page size >= 1.
 """
 
+import functools
 import logging
 
 import torch
@@ -35,8 +36,15 @@ from packaging import version
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.mem_utils import get_max_shared_memory_bytes
 
 is_hip_ = current_platform.is_rocm()
+
+
+@functools.cache
+def _max_shared_memory_bytes(device_index: int) -> int:
+    return get_max_shared_memory_bytes(device_index)
+
 
 logger = logging.getLogger(__name__)
 
@@ -528,6 +536,17 @@ def _decode_grouped_att_m_fwd(
         # Avoid shared memory overflow on NVIDIA when BLOCK_DMODEL is large
         # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
         # exceeds 101376 bytes limit
+        num_stages = 1
+    elif (
+        not is_hip_
+        and k_buffer.element_size() == 1
+        and BLOCK_DMODEL + BLOCK_DPE > 512
+        and _max_shared_memory_bytes(q.device.index) < 128 * 1024
+    ):
+        # An fp8 KV cache with the MLA tile (BLOCK_DMODEL=512, BLOCK_DPE=64)
+        # needs 102400 bytes with two stages, just over the 101376-byte limit
+        # of sm_86/sm_89/sm_12x. One stage needs 83968. bf16 KV (63488) and
+        # the narrower fp8 tiles (<= 82944) still fit two stages.
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](

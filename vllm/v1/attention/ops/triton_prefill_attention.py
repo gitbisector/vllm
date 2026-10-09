@@ -25,11 +25,41 @@ It supports page size = 1.
 
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
+import functools
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import RCP_LN2
+from vllm.utils.mem_utils import get_max_shared_memory_bytes
+
+
+@functools.cache
+def _max_shared_memory_bytes(device_index: int) -> int:
+    return get_max_shared_memory_bytes(device_index)
+
+
+def _fit_tile_to_shared_memory(
+    block: int, block_dmodel: int, element_size: int, device: torch.device
+) -> int:
+    """Halve the tile until the kernel's shared memory fits the device.
+
+    With num_stages=1 the kernel keeps the K and V tiles (BLOCK_N x BLOCK_DMODEL
+    each) and the BLOCK_M x BLOCK_N score tile in shared memory, in the input
+    dtype. GPUs with 99 KiB per block (sm_86, sm_89, sm_120, sm_121) cannot
+    hold the 128-row tile of a 256-wide head (160 KiB), nor the 32-row float32
+    tile of a 512-wide head (132 KiB).
+    """
+    if not current_platform.is_cuda():
+        return block
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    limit = _max_shared_memory_bytes(device_index)
+    while block > 16 and (2 * block_dmodel + block) * block * element_size > limit:
+        block //= 2
+    return block
 
 
 def _prefer_narrow_kv_tile() -> bool:
@@ -247,6 +277,8 @@ def context_attention_fwd(
     BLOCK = get_block_size(q.dtype)
     if Lk >= 512:
         BLOCK = min(BLOCK, 32)
+    BLOCK_DMODEL = triton.next_power_of_2(Lk)
+    BLOCK = _fit_tile_to_shared_memory(BLOCK, BLOCK_DMODEL, q.element_size(), q.device)
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
     # rescale with 1/ln(2) for triton exp2
@@ -286,7 +318,7 @@ def context_attention_fwd(
         o.stride(1),
         kv_group_num=kv_group_num,
         BLOCK_M=BLOCK,
-        BLOCK_DMODEL=triton.next_power_of_2(Lk),
+        BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_N=BLOCK_N,
         IS_CAUSAL=is_causal,
         SLIDING_WINDOW_Q=sliding_window_q,

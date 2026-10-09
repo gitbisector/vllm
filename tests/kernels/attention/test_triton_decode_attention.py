@@ -235,6 +235,62 @@ def test_decode_attention_fp8(B, L, H_Q, H_KV, D_QK, D_V, CACHE_SIZE, PAGE_SIZE)
     torch.testing.assert_close(o_ref, o_fp8, atol=5e-1, rtol=1e-2)
 
 
+@pytest.mark.parametrize("H_Q", [16, 32])
+@pytest.mark.parametrize("PAGE_SIZE", [16])
+def test_decode_attention_mla_fp8(H_Q, PAGE_SIZE):
+    """The MLA tile (Lk=576: BLOCK_DMODEL=512, BLOCK_DPE=64) with an fp8 KV
+    cache needs 102400 bytes of shared memory at num_stages=2, which exceeds
+    the 101376-byte limit of sm_86/sm_89/sm_12x GPUs. Compare the fp8 path
+    against the bf16 one."""
+    B = 3
+    L = 1025
+    H_KV = 1
+    D_QK = 576
+    D_V = 512
+    CACHE_SIZE = 16384
+    dtype = torch.bfloat16
+    sm_scale = 1.0 / (D_QK**0.5)
+    num_kv_splits = 8
+    num_pages = CACHE_SIZE // PAGE_SIZE
+
+    req_to_page = torch.randint(
+        0, num_pages, (B, cdiv(L, PAGE_SIZE)), device=DEVICE_TYPE
+    )
+    b_seq_len = torch.full((B,), L, device=DEVICE_TYPE)
+    q = torch.randn(B, H_Q, D_QK, dtype=dtype, device=DEVICE_TYPE)
+    k_bf16 = torch.randn(
+        num_pages, PAGE_SIZE, H_KV, D_QK, dtype=dtype, device=DEVICE_TYPE
+    )
+    k_fp8, k_scale = _quantize_to_fp8(k_bf16)
+
+    def run(k_buffer, **kwargs):
+        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=DEVICE_TYPE)
+        lse = torch.zeros(B, H_Q, dtype=dtype, device=DEVICE_TYPE)
+        attn_logits = torch.empty(
+            (B, H_Q, num_kv_splits, D_V + 1), dtype=torch.float32, device=DEVICE_TYPE
+        )
+        decode_attention_fwd(
+            q,
+            k_buffer,
+            k_buffer[..., :D_V],
+            o,
+            lse,
+            req_to_page,
+            b_seq_len,
+            attn_logits,
+            num_kv_splits,
+            sm_scale,
+            PAGE_SIZE,
+            is_mla=True,
+            **kwargs,
+        )
+        return o
+
+    o_ref = run(k_bf16)
+    o_fp8 = run(k_fp8, k_scale=k_scale, v_scale=k_scale)
+    torch.testing.assert_close(o_ref, o_fp8, atol=5e-1, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "H_Q,H_KV,D_QK,D_V,is_mla",
     [
