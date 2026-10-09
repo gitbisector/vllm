@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import functools
 from typing import Any
 
 import torch
@@ -15,6 +16,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
@@ -31,6 +33,13 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
+
+
+@functools.cache
+def _max_shared_memory_bytes(device_index: int) -> int:
+    return get_max_shared_memory_bytes(device_index)
+
+
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -966,6 +975,19 @@ def unified_attention(
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 8
         launch_num_stages = 2
+    elif (
+        head_size >= 512
+        and q.element_size() >= 2
+        and (window_size[0] >= 0 or k.element_size() == 1)
+        and current_platform.is_cuda()
+        and _max_shared_memory_bytes(q.device.index) < 128 * 1024
+    ):
+        # With Triton's default num_stages a 512-wide 16-bit-query head needs
+        # 115968 bytes of shared memory with a sliding window (115712 at two
+        # stages) and 114944 with an fp8 KV cache, above the 101376-byte limit
+        # of sm_86/sm_89/sm_12x. One stage needs 50176 / 81920. The plain
+        # 16-bit path fits (83200), as does an fp8 query (82176).
+        launch_num_stages = 1
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
