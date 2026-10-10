@@ -218,3 +218,82 @@ def test_humming_priority_only_reorders_humming_and_marlin(possible_kernels):
     del names[humming]
     assert names == [k.__name__ for k in original if "Humming" not in k.__name__]
     assert kernels == original
+
+
+def test_cutlass_fp8_priority_on_gb10_only_moves_flashinfer():
+    """On GB10 (sm_121) CUTLASS must outrank FlashInfer for per-tensor FP8
+    (#59770); every other entry keeps its order and other archs, including
+    sm_120, are untouched."""
+    from vllm.model_executor.kernels.linear import (
+        _POSSIBLE_FP8_KERNELS,
+        CutlassFP8ScaledMMLinearKernel,
+        FlashInferFP8ScaledMMLinearKernel,
+        prioritize_cutlass_fp8_on_gb10,
+    )
+
+    kernels = _POSSIBLE_FP8_KERNELS[PlatformEnum.CUDA]
+    original = list(kernels)
+    assert original.index(FlashInferFP8ScaledMMLinearKernel) < original.index(
+        CutlassFP8ScaledMMLinearKernel
+    )
+
+    for cc in (90, 100, 103, 120):
+        assert prioritize_cutlass_fp8_on_gb10(kernels, cc) == original
+
+    for cc in (121,):
+        reordered = prioritize_cutlass_fp8_on_gb10(kernels, cc)
+        assert reordered.index(CutlassFP8ScaledMMLinearKernel) + 1 == reordered.index(
+            FlashInferFP8ScaledMMLinearKernel
+        )
+        rest = [k for k in reordered if k is not FlashInferFP8ScaledMMLinearKernel]
+        assert rest == [
+            k for k in original if k is not FlashInferFP8ScaledMMLinearKernel
+        ]
+    assert kernels == original
+
+
+@pytest.mark.parametrize(
+    "capability,linear_backend,expected",
+    [
+        ((12, 1), "auto", "CutlassFP8ScaledMMLinearKernel"),
+        ((12, 0), "auto", "FlashInferFP8ScaledMMLinearKernel"),
+        ((10, 0), "auto", "FlashInferFP8ScaledMMLinearKernel"),
+        ((12, 1), "flashinfer_cutlass", "FlashInferFP8ScaledMMLinearKernel"),
+    ],
+)
+@patch("vllm.model_executor.kernels.linear.current_platform")
+def test_fp8_linear_kernel_selection_per_arch(
+    platform_mock, capability, linear_backend, expected
+):
+    """Auto selection picks CUTLASS over FlashInfer for per-tensor FP8 on GB10
+    (sm_121) and keeps FlashInfer on sm_120 and sm_100; an explicit
+    --linear-backend flashinfer_cutlass still selects FlashInfer on GB10."""
+    from vllm.model_executor.kernels.linear import (
+        CutlassFP8ScaledMMLinearKernel,
+        FlashInferFP8ScaledMMLinearKernel,
+    )
+    from vllm.platforms.interface import DeviceCapability
+
+    platform_mock._enum = PlatformEnum.CUDA
+    platform_mock.is_cuda.return_value = True
+    platform_mock.get_device_capability.return_value = DeviceCapability(*capability)
+    config = VllmConfig(kernel_config=KernelConfig(linear_backend=linear_backend))
+
+    with (
+        patch.object(
+            FlashInferFP8ScaledMMLinearKernel, "is_supported", return_value=(True, None)
+        ),
+        patch.object(
+            CutlassFP8ScaledMMLinearKernel, "is_supported", return_value=(True, None)
+        ),
+        set_current_vllm_config(config),
+    ):
+        kernel = init_fp8_linear_kernel(
+            activation_quant_key=kFp8StaticTensorSym,
+            weight_quant_key=kFp8StaticTensorSym,
+            input_dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+            weight_shape=(128, 128),
+        )
+
+    assert type(kernel).__name__ == expected

@@ -375,6 +375,36 @@ def _filter_kernels_by_backend(
     return filtered
 
 
+def prioritize_cutlass_fp8_on_gb10(
+    kernels: list[type],
+    compute_capability: int | None = None,
+) -> list[type]:
+    """Rank CUTLASS ahead of FlashInfer for per-tensor FP8 on GB10 (sm_121).
+
+    FlashInfer's bmm_fp8 resolves to cuBLAS there, 1.5x slower than the CUTLASS
+    sm_120 kernel at decode M (vllm-project/vllm#59770). Measured on GB10 only;
+    sm_120 keeps the default order pending data. Only the FlashInfer entry
+    moves; an explicit --linear-backend still selects it.
+    """
+    if compute_capability is None and current_platform.is_cuda():
+        cc = current_platform.get_device_capability()
+        compute_capability = cc.to_int() if cc is not None else None
+    if compute_capability != 121:
+        return kernels
+    if (
+        FlashInferFP8ScaledMMLinearKernel not in kernels
+        or CutlassFP8ScaledMMLinearKernel not in kernels
+    ):
+        return kernels
+    flashinfer = kernels.index(FlashInferFP8ScaledMMLinearKernel)
+    cutlass = kernels.index(CutlassFP8ScaledMMLinearKernel)
+    if cutlass < flashinfer:
+        return kernels
+    kernels = kernels.copy()
+    kernels.insert(cutlass, kernels.pop(flashinfer))
+    return kernels
+
+
 def _resolve_backend_kernels(
     kernels: list[type],
     layer_desc: str,
@@ -392,6 +422,7 @@ def _resolve_backend_kernels(
     projections).
     """
     kernels = prioritize_humming(kernels, compute_capability)
+    kernels = prioritize_cutlass_fp8_on_gb10(kernels, compute_capability)
     linear_backend = _get_linear_backend(quantization=quantization)
     if linear_backend == "auto":
         return kernels
