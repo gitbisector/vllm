@@ -38,7 +38,11 @@ def _scatter_states_kernel(
 
     state_idx = tl.load(indices_ptr + batch_idx * stride_indices).to(tl.int64)
     values = tl.load(src_ptr + batch_idx * stride_src_batch + offsets, mask=mask)
-    tl.store(state_ptr + state_idx * stride_state_batch + offsets, values, mask=mask)
+    # Only store if state index is valid (not NULL_BLOCK_ID=0)
+    if state_idx > 0:
+        tl.store(
+            state_ptr + state_idx * stride_state_batch + offsets, values, mask=mask
+        )
 
 
 def _scatter_states_warmup_inputs(
@@ -77,7 +81,8 @@ def scatter_states(
     """Scatter ``src`` rows into ``state`` at ``indices`` (in place).
 
     Equivalent to ``state[indices] = src`` but non-atomic and bandwidth-bound,
-    since mamba cache slots are unique per sequence. ``gather_initial_states``
+    since mamba cache slots are unique per sequence. Rows whose index is
+    ``<= 0`` (``NULL_BLOCK_ID`` or invalid) are skipped. ``gather_initial_states``
     is the read-side counterpart.
     """
     assert state.ndim >= 2
